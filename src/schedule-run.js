@@ -1,6 +1,6 @@
 'use strict';
 // Calls the dispatcher for one job, then pings healthchecks.io with the result.
-// Usage: node scheduled/run.js <job>
+// Usage: node src/schedule-run.js <job>
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');

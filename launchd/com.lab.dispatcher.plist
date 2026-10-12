@@ -6,7 +6,7 @@
   <key>ProgramArguments</key>
   <array>
     <string>/opt/homebrew/bin/node</string>
-    <string>/Users/timothyspray/main/server.js</string>
+    <string>/Users/timothyspray/main/src/server.js</string>
   </array>
   <key>WorkingDirectory</key><string>/Users/timothyspray/main</string>
   <key>RunAtLoad</key><true/>

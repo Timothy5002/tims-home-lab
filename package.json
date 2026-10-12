@@ -3,8 +3,8 @@
   "version": "1.0.0",
   "private": true,
   "description": "Localhost job dispatcher: POST /run/:job runs ./jobs/<job>.sh",
-  "main": "server.js",
-  "scripts": { "start": "node server.js" },
+  "main": "src/server.js",
+  "scripts": { "start": "node src/server.js" },
   "engines": { "node": ">=24" },
   "dependencies": { "fastify": "5.12.5" }
 }

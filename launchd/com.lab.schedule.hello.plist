@@ -6,7 +6,7 @@
   <key>ProgramArguments</key>
   <array>
     <string>/opt/homebrew/bin/node</string>
-    <string>/Users/timothyspray/main/scheduled/run.js</string>
+    <string>/Users/timothyspray/main/src/schedule-run.js</string>
     <string>hello</string>
   </array>
   <key>WorkingDirectory</key><string>/Users/timothyspray/main</string>

@@ -1,4 +1,6 @@
 'use strict';
+// The dispatcher: Fastify on 127.0.0.1:8787. POST /run/:job runs jobs/<job>.sh (auth, name check, 60s timeout, logged).
+// See docs/architecture.md for the request flow and why each guard exists.
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -12,7 +14,7 @@ const PORT = 8787;
 const TIMEOUT_MS = 60_000;
 const MAX_OUTPUT = 1024 * 1024;
 const JOB_NAME = /^[a-z0-9-]+$/;
-const JOBS_DIR = fs.realpathSync(path.join(__dirname, 'jobs'));
+const JOBS_DIR = fs.realpathSync(path.join(__dirname, '..', 'jobs'));
 const TOKEN_PATH = path.join(os.homedir(), '.lab', 'token');
 
 function loadToken() {
