@@ -24,6 +24,7 @@ Optional, for jobs that use the LLM helper: Ollama from Homebrew (`brew services
 launchctl print gui/$(id -u)/com.lab.dispatcher | grep -E 'state|pid'      # is it running?
 launchctl kickstart -k gui/$(id -u)/com.lab.dispatcher                     # restart it
 launchctl kickstart -k gui/$(id -u)/com.lab.schedule.hello                 # run a schedule now
+launchctl kickstart -k gui/$(id -u)/com.lab.schedule.disk-check            # run the disk check now
 sqlite3 -header -column data/dispatcher.db "select * from runs order by id desc limit 10"
 node scripts/llm-eval.js                                                   # check the LLM prompt templates
 curl -s 127.0.0.1:11434/api/ps                                             # is the model loaded right now?
@@ -39,4 +40,6 @@ After editing a file in `launchd/`, reinstall it with `scripts/install-agent.sh 
 | Healthchecks.io shows down | Check `~/Library/Logs/lab-dispatcher/schedule-<job>.log`; was the Mac off at run time, or the job failing? |
 | A job's `llm:` line says `cannot reach Ollama` | `brew services restart ollama`; check `curl -s 127.0.0.1:11434/api/tags` lists `qwen2.5:7b` |
 | `llm: model timed out` | The model was cold and the job was already near its limit; give the call a larger share of the 60s, or make fewer calls per job |
+| `disk-check` fails | Free space on the internal drive is under 25% or under 40 GB; the job's output (in `schedule-disk-check.log` and the healthchecks.io ping body) shows the numbers |
+| `disk-check` lists `Library`, `Documents` etc. as unreadable | Expected. Jobs run under launchd's `node`, which macOS privacy does not let into protected folders, and Full Disk Access is deliberately not granted. Free space is still exact; only the folder list is incomplete |
 | Nothing runs after a reboot | Auto-login is off, or the agent isn't installed in `~/Library/LaunchAgents/` |
