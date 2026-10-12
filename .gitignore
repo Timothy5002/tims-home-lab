@@ -1,0 +1,14 @@
+node_modules/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.log
+logs/
+.env
+.env.*
+token
+token.*
+*.pem
+*.key
+.DS_Store
