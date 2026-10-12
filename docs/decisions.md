@@ -3,7 +3,8 @@
 | Decision | Why |
 |---|---|
 | Jobs are files in `jobs/`, not commands in the request | A caller can only pick *which* script runs, never what it does. Adding capability means adding a reviewed file. |
-| `execFile`, never a shell | No shell means no injection through names or arguments. Jobs receive no arguments at all. |
+| `spawn` without a shell | No shell means no injection through names or arguments. Jobs receive no arguments at all. |
+| Each job runs in its own process group, and the timeout kills the group | Killing only the job's shell left its children running: a `du` stuck on a macOS privacy prompt outlived its `disk-check` run. `spawn` is used because `execFile` ignores the `detached` option that creates the group. |
 | Bind to `127.0.0.1`, hardcoded | Nothing off this machine can reach it. No env override, so a config slip cannot expose it. |
 | Token in `~/.lab/token`, mode enforced at startup | Keeps the secret out of the repo, plists and logs; the server refuses to start with a loose file. |
 | `/health` is the only unauthenticated route | Liveness checks need no secret and reveal nothing. |

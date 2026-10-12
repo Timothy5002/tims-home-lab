@@ -17,7 +17,7 @@
 1. **Token check.** `Authorization: Bearer <token>` is compared in constant time with `~/.lab/token`. Failure: 401.
 2. **Name check.** The name must match `^[a-z0-9-]+$`. Failure: 400.
 3. **Lookup.** `jobs/<name>.sh` is resolved with `realpath`; it must be an executable regular file **directly inside** `jobs/`. Symlinks that point elsewhere are rejected. Failure: 404.
-4. **Run.** `execFile` (no shell), no arguments, `cwd=jobs/`, minimal environment (`PATH` only), 60s timeout (then SIGKILL), 1 MB output cap.
+4. **Run.** `spawn` (no shell), no arguments, `cwd=jobs/`, minimal environment (`PATH` only), in a **new process group**. After 60s, or if output passes 1 MB, the whole group gets SIGKILL, so any program the job started dies with it. Output is stdout followed by stderr; a killed job reports exit code `-1`.
 5. **Log + respond.** One row is written to `runs` and the result is returned. Steps 1 to 3 also write a row (status `unauthorized`, `bad-name`, `not-found`), so rejected attempts are visible.
 
 ## The `runs` table

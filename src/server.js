@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { execFile } = require('node:child_process');
+const { spawn } = require('node:child_process');
 const Fastify = require('fastify');
 const { logRun } = require('./db');
 
@@ -48,6 +48,12 @@ function resolveJob(name) {
   }
 }
 
+// SIGKILL a job's whole process group (negative pid). ESRCH just means it already exited.
+function killGroup(pid) {
+  if (!pid) return; // spawn failed, nothing to kill
+  try { process.kill(-pid, 'SIGKILL'); } catch (e) { if (e.code !== 'ESRCH') app.log.error(e); }
+}
+
 const app = Fastify({ logger: true });
 
 const sourceOf = (req) => `${req.ip}${req.headers['x-source'] ? ` (${String(req.headers['x-source']).slice(0, 100)})` : ''}`;
@@ -70,12 +76,34 @@ app.post('/run/:job', async (req, reply) => {
 
   const t0 = process.hrtime.bigint();
   const result = await new Promise((resolve) => {
-    execFile(file, [], { cwd: JOBS_DIR, timeout: TIMEOUT_MS, killSignal: 'SIGKILL', maxBuffer: MAX_OUTPUT, env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin' } },
-      (err, stdout, stderr) => {
-        const timedOut = !!(err && err.killed && err.signal === 'SIGKILL');
-        const exitCode = err ? (typeof err.code === 'number' ? err.code : -1) : 0;
-        resolve({ exitCode, timedOut, output: `${stdout}${stderr}` });
+    // spawn (not execFile, which ignores `detached`) with detached: true puts the job in its own process
+    // group, so a timeout SIGKILLs everything it started (e.g. a du stuck on a privacy prompt), not just
+    // the job's shell. Still no shell and no arguments. See docs/decisions.md.
+    let timedOut = false;
+    let overCap = false;
+    const out = { stdout: [], stderr: [] };
+    let bytes = 0;
+    const child = spawn(file, [], { cwd: JOBS_DIR, detached: true, stdio: ['ignore', 'pipe', 'pipe'], env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin' } });
+    const timer = setTimeout(() => { timedOut = true; killGroup(child.pid); }, TIMEOUT_MS);
+    for (const stream of ['stdout', 'stderr']) {
+      child[stream].on('data', (chunk) => {
+        if (overCap) return;
+        bytes += chunk.length;
+        if (bytes > MAX_OUTPUT) { overCap = true; killGroup(child.pid); return; }
+        out[stream].push(chunk);
       });
+    }
+    let done = false;
+    const finish = (exitCode) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      const output = `${Buffer.concat(out.stdout)}${Buffer.concat(out.stderr)}${overCap ? '\n[output over 1 MB; job killed]\n' : ''}`;
+      resolve({ exitCode, timedOut, output });
+    };
+    child.on('error', () => finish(-1)); // could not start
+    // 'close' waits for the output pipes too, so a leftover background process keeps the run open until the timeout kills it.
+    child.on('close', (code) => finish(typeof code === 'number' && !timedOut && !overCap ? code : -1));
   });
   const durationMs = Number((process.hrtime.bigint() - t0) / 1_000_000n);
   const status = result.timedOut ? 'timeout' : 'ok';

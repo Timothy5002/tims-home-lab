@@ -3,7 +3,7 @@
 Node + Fastify service on this Mac mini that runs named jobs on request. Rules below are binding for every session. Start with `README.md` for the map of the repo; details are in `docs/`.
 
 ## Rules
-- `POST /run/:job` runs `./jobs/<job>.sh` with a 60s timeout (SIGKILL on expiry).
+- `POST /run/:job` runs `./jobs/<job>.sh` in its own process group with a 60s timeout; on expiry the whole group gets SIGKILL, so nothing the job started outlives it.
 - Auth: Bearer token read from `~/.lab/token` (dir 700, file 600). The token never goes in the repo, in chat, in logs, or in the plist. The server refuses to start if the file is looser than 600.
 - Job names must match `^[a-z0-9-]+$` and map only to executable regular files directly inside `./jobs/` (realpath-checked). No arbitrary commands, no shell, no request data passed to jobs.
 - Listen on `127.0.0.1:8787` only. The host is hardcoded; do not add an env override or bind to 0.0.0.0.
