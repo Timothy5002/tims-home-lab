@@ -48,7 +48,7 @@ async function ping(base, failed, body) {
   console.log(`[${stamp}] ${failed ? 'FAIL' : 'OK'} ${summary}`);
 
   try {
-    await ping(readSecret('healthcheck-url'), failed, summary);
+    await ping(readSecret(`healthcheck-url-${job}`), failed, summary);
     console.log(`[${stamp}] healthcheck ping sent (${failed ? 'fail' : 'success'})`);
   } catch (e) {
     console.error(`[${stamp}] healthcheck ping failed: ${e.message}`);
