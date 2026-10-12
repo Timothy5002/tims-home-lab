@@ -27,6 +27,14 @@ Node + Fastify service on this Mac mini that runs named jobs on request. Rules b
 - Node comes from Homebrew (`/opt/homebrew/bin/node`). SQLite uses the built-in `node:sqlite`, so there is no native dependency.
 - Add a job by dropping an executable `jobs/<name>.sh`; no server change needed. Full steps: `docs/adding-jobs.md`.
 
+## LLM helper for jobs
+- Jobs call `node "$(dirname "$0")/../src/llm.js" <task> [options]` with the input text on **stdin** (never as an argument) and read the result on stdout. Full usage: `docs/adding-jobs.md`.
+- Local tasks (Ollama `qwen2.5:7b` at `127.0.0.1:11434`, hardcoded): `classify --label name=description ...` (prints one label), `extract --fields a,b` (one-line JSON, null when absent), `summarize-short` (1-3 sentences). Any other task exits 3 with "needs cloud model"; do not add a cloud provider without the user's approval.
+- Fixed limits: temperature 0.1, structured JSON output for classify and extract, per-task `num_predict` caps, 8,000-character input cap, 50s per call (`--timeout` may only lower it), `keep_alive: 1m` per request. Exit codes: 0 ok, 2 bad usage or input, 3 needs cloud model, 4 model error or timeout.
+- Several calls in one job share the 60s job limit; pass a shrinking `--timeout` like `jobs/llm-test.sh` does.
+- Never log, store or print input text (the helper doesn't, and a job must not echo it either), and never print the token.
+- Prompt templates live in `src/llm-prompts.js`, each with 1-2 examples. After changing one, run `node scripts/llm-eval.js` and keep it passing.
+
 ## Scheduled jobs
 - Schedules call the dispatcher; they never run job files directly. `src/schedule-run.js <job>` POSTs to `/run/<job>` (source `launchd-schedule`, so runs land in SQLite), then pings healthchecks.io: `GET <url>` on success, `<url>/fail` on any failure (dispatcher down, non-200, non-zero exit, timeout). The ping URL is read from `~/.lab/healthcheck-url-<job>` (one file per job, mode 600, never in the repo, logs, or chat); the wrapper fails without pinging if the file is missing or looser than 600.
 - **Always prompt for a healthcheck URL.** Whenever the user asks for a new scheduled job (or a new job that will run on a schedule), do not create the plist or the schedule until you have told the user to create a new healthchecks.io check for it and put its URL in `~/.lab/healthcheck-url-<name>` (`umask 077; pbpaste > ~/.lab/healthcheck-url-<name>`, then chmod 600). Suggest a period and grace time that match the schedule. Never reuse another job's URL. Confirm the file exists with mode 600 before installing the schedule. A job that is only run on demand (no schedule) needs no check.

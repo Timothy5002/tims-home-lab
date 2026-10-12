@@ -7,3 +7,4 @@ Rules: lowercase letters, digits and hyphens in the name; executable (`chmod +x`
 | Job | What it does | Scheduled |
 |---|---|---|
 | `hello` | Prints a greeting with the hostname and time; proves the pipeline works | Daily 06:00 (`com.lab.schedule.hello`) |
+| `llm-test` | Classifies four made-up sample emails (urgent / reply / fyi / noise) with the LLM helper; proves Ollama works end to end | No (on demand) |

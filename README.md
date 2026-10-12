@@ -17,9 +17,11 @@ A small service on the home-lab Mac mini that runs **named shell jobs on request
 | `src/server.js` | The Fastify service | Auth, job lookup, timeout, response |
 | `src/db.js` | SQLite run log | Audit trail of every request |
 | `src/schedule-run.js` | Scheduled-run wrapper | Calls the dispatcher, then pings healthchecks.io |
+| `src/llm.js` | Shared LLM helper for jobs | Lets a job classify, extract or summarize text with the local Ollama model; see `docs/adding-jobs.md` |
+| `src/llm-prompts.js` | Prompt templates for `src/llm.js` | One tested template per task type, kept apart from the plumbing |
 | `jobs/` | The runnable jobs (`<name>.sh`) | The only things the service can execute. See `jobs/README.md` |
 | `launchd/` | LaunchAgent plist templates | Keep the service and schedules running; one file per agent |
-| `scripts/` | Operator helpers | `install-agent.sh` installs a plist from `launchd/` |
+| `scripts/` | Operator helpers | `install-agent.sh` installs a plist from `launchd/`; `llm-eval.js` checks the LLM prompt templates |
 | `data/` | Runtime data (git-ignored) | Holds `dispatcher.db` |
 | `docs/` | Detailed documentation | Architecture, operations, adding jobs, design decisions |
 | `CLAUDE.md` | Rules for Claude Code sessions | Binding rules and conventions; humans should read it too |
