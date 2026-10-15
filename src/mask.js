@@ -21,8 +21,21 @@ const SECRET_PATTERNS = [
   ['jwt', /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g],
   ['long-hex', /\b[0-9a-fA-F]{32,}\b/g],                               // hashes, keys
 ];
-// Long base64-like strings: only counted as secrets if they mix letters and digits (plain words never match).
-const BASE64ISH = /(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{40,}={0,2}(?![A-Za-z0-9+/_-])/g;
+// Long base64-like tokens. One unbroken token with no "/" (so URL and file paths are never one match), and it
+// must mix upper case, lower case and digits, as random keys do. UUIDs and hyphenated word slugs are not secrets.
+// (A real-data check found every earlier hit was a URL path holding a UUID or words; see docs/decisions.md.)
+const BASE64ISH = /(?<![A-Za-z0-9+/_=-])[A-Za-z0-9+_-]{40,}={0,2}(?![A-Za-z0-9+/_=-])/g;
+const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+// Mostly words joined by hyphens or underscores, like "Setup-Your-Account-In-5-Steps".
+function wordSlug(token) {
+  const parts = token.split(/[-_]/).filter(Boolean);
+  const wordish = parts.filter((p) => /^[A-Za-z]{2,}$/.test(p)).length;
+  return parts.length >= 3 && wordish >= parts.length / 2;
+}
+function secretLike(token) {
+  if (!/[A-Z]/.test(token) || !/[a-z]/.test(token) || !/\d/.test(token) || UUID.test(token)) return false;
+  return !wordSlug(token);
+}
 
 const EMAIL = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
 const URL_RE = /\bhttps?:\/\/[^\s<>|]+/g;
@@ -44,7 +57,7 @@ function maskSecrets(text, counts = newCounts(), onHit = () => {}) {
   let s = String(text);
   for (const [name, re] of SECRET_PATTERNS) s = s.replace(re, () => { counts.secret++; onHit('secret', name); return '[secret]'; });
   s = s.replace(BASE64ISH, (m) => {
-    if (!mixed(m)) return m;
+    if (!secretLike(m)) return m;
     counts.secret++;
     onHit('secret', 'base64');
     return '[secret]';
@@ -69,7 +82,7 @@ function maskText(text, counts = newCounts(), onHit = () => {}) {
     // Trailing punctuation (a closing bracket, full stop, comma...) belongs to the sentence, not the URL.
     const [, u, tail] = /^(.*?)([).,;:!?'"]*)$/.exec(match);
     const tokenish = TOKENISH_SEGMENT.exec(u);
-    if (u.includes('?') || (tokenish && mixed(tokenish[1]))) { counts.url++; onHit('url', u.includes('?') ? 'url-query' : 'url-token'); return `[url]${tail}`; }
+    if (u.includes('?') || (tokenish && mixed(tokenish[1]) && !wordSlug(tokenish[1]))) { counts.url++; onHit('url', u.includes('?') ? 'url-query' : 'url-token'); return `[url]${tail}`; }
     return match;
   });
 

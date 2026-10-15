@@ -120,8 +120,10 @@ function createClient() {
 //              members (full names, you included) is the set the ID was matched on, and is re-checked on every run.
 //   pendingGroupDms: [{ label, bu, sub?, candidates: [ids], note? }]  not matched; listed in the report until decided.
 //   external:  { units: [bu, ...], internalPrefixes: [prefix, ...] }  which conversations count as external
-//              (masked before any model call): a conversation in one of these units whose name does not start
-//              with an internal prefix. Slack's own is_ext_shared flag also makes a conversation external.
+//              (fully masked before any model call): a conversation in one of these units whose name does not
+//              start with an internal prefix. Nothing else is external. Slack's is_ext_shared flag is recorded
+//              by the listing but deliberately not used: the user decided shared conversations outside these
+//              rules are internal (most are shared between the company's own workspaces).
 // Matching is case-insensitive. Keys starting with "_" are comments.
 const globToRegex = (g) => new RegExp(`^${g.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*')}$`, 'i');
 
@@ -187,15 +189,13 @@ function loadConfig() {
 const groupName = (t) => (t.sub ? `${t.bu} > ${t.sub}` : t.bu);
 const sameSet = (a, b) => a.length === b.length && [...a].sort().every((x, i) => x === [...b].sort()[i]);
 
-// Why a conversation is external (empty list = internal). Derived from the config and the listing, never stored
-// by hand. Rule 1: it is in an external unit and its name lacks an internal prefix (group DMs included).
-// Rule 2: Slack marks it as shared with another organization (only in listings made after this field was saved).
+// Why a conversation is external (empty list = internal). Derived from the config, never stored by hand: it is
+// in an external unit and its name lacks an internal prefix (the unit's group DMs included).
 function externalReasons(cfg, ch, bu) {
   const why = [];
   if (bu && cfg.external.units.includes(bu) && !cfg.external.internalPrefixes.some((p) => ch.name.toLowerCase().startsWith(p.toLowerCase()))) {
     why.push('unit rule');
   }
-  if (ch.isExtShared === true) why.push('Slack shared');
   return why;
 }
 

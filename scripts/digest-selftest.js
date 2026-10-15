@@ -47,9 +47,27 @@ const MASK_CASES = [
   ['long hex', 'hash 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08', 'hash [secret]', { secret: 1 }],
   ['base64 secret', 'cred dGhpc2lzYXZlcnlsb25nc2VjcmV0dmFsdWUxMjM0NTY3ODkw', 'cred [secret]', { secret: 1 }],
   ['long word kept', 'pneumonoultramicroscopicsilicovolcanoconiosis is long', 'pneumonoultramicroscopicsilicovolcanoconiosis is long', {}],
+  ['mixed-case random key still masked', 'key Zq8Rt2Lm9Xv4Bn7Ks1Wd6Hj3Pf5Gc0Ty8Ue2Ma7Qp in config', 'key [secret] in config', { secret: 1 }],
   ['several at once', 'Jane (jane@ex.com, 555.987.6543) acct 99887766',
     'Jane ([email], [phone]) acct [number]', { email: 1, phone: 1, number: 1 }],
 ];
+// Secrets-only masking (every conversation): false positives found on real data. Shapes only were inspected;
+// these examples are invented. URL paths, file paths and slugs must survive.
+for (const [name, input] of [
+  ['URL path with UUID', 'Recording: https://calls.example.test/r/3f2b9c1e-8a7d-4e6f-9b0a-1c2d3e4f5a6b/audio'],
+  ['URL path of words', 'See https://docs.example.test/Guides/Setup-Your-Account-In-5-Steps/v2'],
+  ['file path', 'Saved to Reports/Q3-Customer-Summary-Final-2026/Export-Version-12.csv'],
+  ['slug of words and digits', 'branch fix-retry-logic-for-webhook-handler-v2-2026'],
+  ['long token with no upper case', 'id 9f8e7d6c5b4a39281706f5e4d3c2b1a0_9f8e7d6c5b4a3928 ok'],
+]) {
+  const counts = newCounts();
+  const got = maskSecrets(input, counts);
+  check(`mask secrets-only: ${name} kept`, got === input && counts.secret === 0, `got "${got}"`);
+}
+check('mask: URL whose path is hyphenated words is not a token',
+  maskText('See https://docs.example.test/Guides/Setup-Your-Account-In-5-Steps/v2') === 'See https://docs.example.test/Guides/Setup-Your-Account-In-5-Steps/v2');
+check('mask: URL with a UUID path is still masked in external text',
+  maskText('Recording: https://calls.example.test/r/3f2b9c1e-8a7d-4e6f-9b0a-1c2d3e4f5a6b/audio') === 'Recording: [url]');
 for (const [name, input, want, wantCounts] of MASK_CASES) {
   const counts = newCounts();
   const got = maskText(input, counts);
@@ -70,6 +88,22 @@ for (const [name, input, want, wantCounts] of MASK_CASES) {
   check('mask: secrets-only keeps names, emails, phones and numbers',
     got === 'Pat Lee (pat@example.com, 555-123-4567) shared [secret] and order 12345678' && counts.secret === 1 && counts.email === 0, `got "${got}"`);
   check('mask: onHit names the pattern that fired', hits.join(',') === 'secret:sk-key', hits.join(','));
+}
+
+{
+  // External = in an external unit and the name lacks an internal prefix; Slack's shared flag does not count.
+  const { placeChannel } = require('../src/slack');
+  const cfg = { rules: [], overrides: {}, groupDms: { G1: { bu: 'Unit B', sub: null } }, pendingGroupDms: [],
+    external: { units: ['Unit B'], internalPrefixes: ['success-', 'bas'] } };
+  cfg.rules = [{ bu: 'Unit B', sub: null, label: 'r', test: () => true }];
+  const ext = (name, extra = {}) => placeChannel(cfg, { id: 'C1', name, type: 'public', ...extra }).external;
+  check('external: customer channel in the external unit is external', ext('acme-coordination') === true);
+  check('external: success- prefix is internal', ext('success-acme') === false);
+  check('external: bas prefix is internal', ext('bas-team-notes') === false && ext('Basement-ops') === false);
+  check('external: Slack shared flag alone does not make it external', ext('success-acme', { isExtShared: true }) === false);
+  check("external: the unit's group DMs are external", placeChannel(cfg, { id: 'G1', name: 'mpdm-a--b-1', type: 'group_dm' }).external === true);
+  const other = { ...cfg, rules: [{ bu: 'Unit A', sub: null, label: 'r', test: () => true }] };
+  check('external: other units are internal even when shared', placeChannel(other, { id: 'C2', name: 'acme-x', type: 'public', isExtShared: true }).external === false);
 }
 
 // ---------- Secret file check ----------

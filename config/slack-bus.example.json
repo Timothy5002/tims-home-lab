@@ -58,8 +58,9 @@
       "Unit B"
     ],
     "internalPrefixes": [
-      "success-"
+      "success-",
+      "bas"
     ]
   },
-  "_external": "Conversations in these units are external (masked before any model call) unless their name starts with an internal prefix. Slack-shared conversations are always external."
+  "_external": "Conversations in these units are external (fully masked before any model call) unless their name starts with an internal prefix. Nothing outside these units is external."
 }

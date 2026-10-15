@@ -55,11 +55,11 @@ Run this after changing masking (`src/mask.js`), the OpenRouter client (`src/ope
 ```bash
 node scripts/slack-channels.js --from-cache
 ```
-Section 6 of that report lists the **external** conversations by unit and sub-group, with counts. Their text gets full masking before any model call. Secrets are masked in every conversation. Names are never masked. External means either:
-- **the unit rule:** `external` in `config/slack-bus.json` lists units and internal name prefixes, and a conversation in one of those units whose name lacks an internal prefix is external
-- **Slack's own flag:** Slack marks the conversation as shared with another organization (`is_ext_shared`)
+Section 6 of that report lists the **external** conversations by unit and sub-group, with counts. Their text gets full masking before any model call. Secrets are masked in every conversation. Names are never masked.
 
-The channel listing records this field. If an older listing lacks it, the report says so.
+**What counts as external:** `external` in `config/slack-bus.json` lists units and internal name prefixes. A conversation in one of those units whose name lacks every internal prefix is external, and that includes the unit's group DMs. Nothing else is.
+
+The listing also records Slack's "shared with another organization" flag, and the report shows how many conversations have it. That flag does **not** make a conversation external: most shared conversations are shared between the company's own workspaces.
 
 **Keeping a conversation away from models:** put its ID in `noCloud` in `config/slack-digest.json`. It is never sent to any model. The digest shows it as "not summarized" with message counts only.
 

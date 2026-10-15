@@ -39,9 +39,8 @@ For each of that unit's customers with activity since the last digest, the diges
 ## Masking
 **Data-sharing decision (recorded by the user).** Slack text may go to the pinned providers below, names included.
 - **Internal conversations go unmasked**, except for secrets. Internal means the customer unit's per-customer success channels and every conversation in every other unit.
-- **External conversations get the full masking.** A conversation is external if either rule says so:
-  - **Rule 1 (configured):** it belongs to a unit listed in the config's external units, and its name does not start with one of that unit's internal prefixes. This covers the unit's group DMs too.
-  - **Rule 2 (Slack's own flag):** Slack marks it as externally shared (`is_ext_shared`, Slack Connect). The channel listing records this field.
+- **External conversations get the full masking.** A conversation is external when it belongs to a unit listed in the config's external units **and** its name does not start with one of that unit's internal prefixes (`external` in `config/slack-bus.json`). This covers the unit's group DMs too. Nothing outside those units is external.
+- **Slack's shared flag is not used.** The channel listing records `is_ext_shared` (Slack Connect) for reference, but most shared conversations here are shared between the company's own workspaces, so the user decided that the flag alone does not make a conversation external.
 - **Secrets are masked in every conversation**, internal ones included, and counted per run.
 
 The external flag is derived by code from the config and the listing; it is not stored by hand. `node scripts/slack-channels.js --from-cache` prints which conversations are external.
