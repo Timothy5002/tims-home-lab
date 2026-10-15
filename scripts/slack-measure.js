@@ -5,6 +5,8 @@
 // dropped. Run scripts/slack-channels.js first. See docs/slack-measurement.md.
 // Usage: node scripts/slack-measure.js [--days 7] [--thread-lookback 30] [--out-tokens 1500]
 //                                      [--in-price USD --out-price USD]   (USD per million tokens)
+//                                      [--unassigned-dms]  also measure unassigned group DMs active in the last
+//                                                          30 days, as a separate "Unassigned DMs" bucket
 const fs = require('node:fs');
 const path = require('node:path');
 const { parseArgs } = require('node:util');
@@ -14,6 +16,8 @@ const CHARS_PER_TOKEN = 4;
 const LOCAL_IN_TPS = 65;      // qwen2.5:7b on this Mac, reading
 const LOCAL_OUT_TPS = 12;     // qwen2.5:7b on this Mac, writing
 const LOCAL_CHUNK_CHARS = 8000; // src/llm.js input cap
+const UNASSIGNED = 'Unassigned DMs';
+const UNASSIGNED_ACTIVE_DAYS = 30; // same test as section 4 of the slack-channels.js report
 
 // Housekeeping events a digest would not read.
 const SKIP_SUBTYPES = new Set([
@@ -25,7 +29,7 @@ const SKIP_SUBTYPES = new Set([
 
 function usage(msg) {
   console.error(`slack-measure: ${msg}`);
-  console.error('usage: node scripts/slack-measure.js [--days 7] [--thread-lookback 30] [--out-tokens 1500] [--in-price USD --out-price USD]');
+  console.error('usage: node scripts/slack-measure.js [--days 7] [--thread-lookback 30] [--out-tokens 1500] [--in-price USD --out-price USD] [--unassigned-dms]');
   process.exit(2);
 }
 
@@ -59,6 +63,7 @@ function label(ch) {
       'out-tokens': { type: 'string', default: '1500' },
       'in-price': { type: 'string' },
       'out-price': { type: 'string' },
+      'unassigned-dms': { type: 'boolean', default: false },
     } }));
   } catch (e) { usage(e.message); }
   const days = numberOpt(opts, 'days', { int: true, min: 1, max: 90 });
@@ -72,8 +77,16 @@ function label(ch) {
   const saved = JSON.parse(fs.readFileSync(CHANNELS_FILE, 'utf8'));
   const cfg = loadConfig();
   // Re-apply the current rules, so editing config/slack-bus.json does not need a new channel listing.
-  const targets = saved.channels.map((c) => ({ ...c, ...placeChannel(cfg, c) })).filter((c) => c.bu);
+  const placed = saved.channels.map((c) => ({ ...c, ...placeChannel(cfg, c) }));
+  const targets = placed.filter((c) => c.bu);
   if (targets.length === 0) usage('no channels are mapped to a business unit; add rules to config/slack-bus.json');
+  // Optional bucket: group DMs nobody assigned (not excluded either) that were recently active. They are measured
+  // like everything else but kept out of the main totals and estimates, so they cannot blur the decision.
+  const cutoff = Date.now() - UNASSIGNED_ACTIVE_DAYS * 86_400_000;
+  const unassigned = !opts['unassigned-dms'] ? [] : placed
+    .filter((c) => c.type === 'group_dm' && c.by === null && c.lastActivity && Date.parse(c.lastActivity) >= cutoff)
+    .map((c) => ({ ...c, bu: UNASSIGNED, sub: null, group: UNASSIGNED, unassigned: true }));
+  targets.push(...unassigned);
 
   // Window: the N full local days before today, so every day in the report is complete.
   const today = new Date(); today.setHours(0, 0, 0, 0);
@@ -84,7 +97,7 @@ function label(ch) {
   const dayList = Array.from({ length: days }, (_, i) => localDay(daysAgo(days - i)));
 
   console.log(`Window: ${dayList[0]} to ${dayList.at(-1)} (${days} full days, local time). Channel list from ${saved.generatedAt}.`);
-  console.log(`Measuring ${targets.length} conversations; threads started up to ${lookback} days back are checked for replies in the window.\n`);
+  console.log(`Measuring ${targets.length} conversations${unassigned.length ? ` (${unassigned.length} of them in "${UNASSIGNED}")` : ''}; threads started up to ${lookback} days back are checked for replies in the window.\n`);
 
   const started = Date.now();
   const slack = createClient();
@@ -106,7 +119,7 @@ function label(ch) {
       if (viaThread) (threadsByDay[day] ??= new Set()).add(m.thread_ts);
     };
     const threads = [];
-    const result = { id: ch.id, name: ch.name, type: ch.type, bu: ch.bu, sub: ch.sub, group: ch.group, label: label(ch), days: perDay };
+    const result = { id: ch.id, name: ch.name, type: ch.type, bu: ch.bu, sub: ch.sub, group: ch.group, unassigned: Boolean(ch.unassigned), label: label(ch), days: perDay };
     try {
       await slack.paginate('conversations.history',
         { channel: ch.id, oldest: String(lookbackStart), latest: String(windowEnd), limit: '200' }, 'messages', (msgs) => {
@@ -134,22 +147,25 @@ function label(ch) {
   // Totals
   const tokens = (chars) => chars / CHARS_PER_TOKEN;
   const sumDays = (rs, field) => Object.fromEntries(dayList.map((day) => [day, rs.reduce((s, r) => s + (r.days[day]?.[field] ?? 0), 0)]));
-  const total = Object.fromEntries(['messages', 'chars', 'threads', 'botChars'].map((f) => [f, sumDays(results, f)]));
+  // Main totals and estimates cover assigned conversations only; the unassigned bucket is reported beside them.
+  const assigned = results.filter((r) => !r.unassigned);
+  const total = Object.fromEntries(['messages', 'chars', 'threads', 'botChars'].map((f) => [f, sumDays(assigned, f)]));
   const avg = (byDay) => Object.values(byDay).reduce((a, b) => a + b, 0) / days;
   const peak = (byDay) => Object.entries(byDay).reduce((best, e) => (e[1] > best[1] ? e : best), [dayList[0], -1]);
 
-  const bus = [...new Set(results.map((r) => r.bu))].sort();
+  const bus = [...new Set(assigned.map((r) => r.bu))].sort();
   const statsFor = (rs) => {
     const chars = sumDays(rs, 'chars');
     const chunks = Object.fromEntries(dayList.map((d) => [d, Math.ceil(chars[d] / LOCAL_CHUNK_CHARS)]));
     return { channels: rs.length, chars, chunks, messages: sumDays(rs, 'messages') };
   };
   const buStats = bus.map((bu) => ({ bu, ...statsFor(results.filter((r) => r.bu === bu)) }));
+  const bucket = unassigned.length ? { bu: UNASSIGNED, ...statsFor(results.filter((r) => r.unassigned)) } : null;
   // Sub-group rows sit under their business unit in the table; channels without a sub-group only count in the BU row.
   const subStats = (bu) => [...new Set(results.filter((r) => r.bu === bu && r.sub).map((r) => r.sub))].sort()
     .map((sub) => ({ bu: `    ${sub}`, ...statsFor(results.filter((r) => r.bu === bu && r.sub === sub)) }));
 
-  console.log('\nTokens per day (all business units):');
+  console.log(`\nTokens per day (all business units${bucket ? `; "${UNASSIGNED}" not included` : ''}):`);
   printTable(['day', 'messages', 'characters', 'est. tokens', 'threads'],
     dayList.map((d) => [d, fmtInt(total.messages[d]), fmtInt(total.chars[d]), fmtInt(tokens(total.chars[d])), fmtInt(total.threads[d])]));
   const [peakDay, peakChars] = peak(total.chars);
@@ -157,10 +173,15 @@ function label(ch) {
   const botShare = avgChars ? avg(total.botChars) / avgChars : 0;
   console.log(`\n  Average: ${fmtInt(tokens(avgChars))} tokens/day.  Peak: ${fmtInt(tokens(peakChars))} on ${peakDay}` +
     (avgChars ? ` (${(peakChars / avgChars).toFixed(1)}x average).` : '.') + `  Bot messages: ${Math.round(botShare * 100)}% of characters.`);
+  if (bucket) {
+    const withChars = Object.fromEntries(dayList.map((d) => [d, total.chars[d] + bucket.chars[d]]));
+    const [wd, wc] = peak(withChars);
+    console.log(`  With "${UNASSIGNED}" (${bucket.channels} group DMs): average ${fmtInt(tokens(avg(withChars)))} tokens/day, peak ${fmtInt(tokens(wc))} on ${wd}.`);
+  }
 
   console.log('\nPer business unit and sub-group (est. tokens):');
   printTable(['business unit / sub-group', 'channels', 'msgs/day', 'avg tokens/day', 'peak tokens/day', 'peak day', '8k-char chunks/day (avg)'],
-    buStats.flatMap((b) => [b, ...subStats(b.bu)]).map((b) => { const [pd, pc] = peak(b.chars); return [b.bu, b.channels, fmtInt(avg(b.messages)), fmtInt(tokens(avg(b.chars))), fmtInt(tokens(pc)), pc > 0 ? pd : "-", avg(b.chunks).toFixed(1)]; }));
+    [...buStats.flatMap((b) => [b, ...subStats(b.bu)]), ...(bucket ? [bucket] : [])].map((b) => { const [pd, pc] = peak(b.chars); return [b.bu, b.channels, fmtInt(avg(b.messages)), fmtInt(tokens(avg(b.chars))), fmtInt(tokens(pc)), pc > 0 ? pd : "-", avg(b.chunks).toFixed(1)]; }));
 
   const totalChars = (r) => Object.values(r.days).reduce((s, d) => s + d.chars, 0);
   const active = results.filter((r) => !r.error && totalChars(r) > 0).sort((a, b) => totalChars(b) - totalChars(a));
@@ -201,7 +222,7 @@ function label(ch) {
   const outFile = path.join(DATA_DIR, `slack-measure-${localDay(new Date())}.json`);
   writePrivateJson(outFile, {
     generatedAt: new Date().toISOString(), days: dayList, threadLookbackDays: lookback, charsPerToken: CHARS_PER_TOKEN,
-    channels: results.map(({ id, name, type, bu, sub, days: d, error }) => ({ id, name, type, bu, sub, days: d, ...(error ? { error } : {}) })),
+    channels: results.map(({ id, name, type, bu, sub, unassigned: u, days: d, error }) => ({ id, name, type, bu, sub, ...(u ? { unassigned: true } : {}), days: d, ...(error ? { error } : {}) })),
   });
   const s = slack.stats;
   console.log(`\n${s.calls} API calls, ${s.rateLimited} rate-limit waits (${Math.round(s.waitedMs / 1000)}s), runtime ${fmtDur(runtimeS)}. Counts saved to ${path.relative(ROOT, outFile)}.`);

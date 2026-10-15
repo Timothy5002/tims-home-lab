@@ -61,6 +61,7 @@ node scripts/slack-measure.js --days 14 --in-price 0.15 --out-price 0.60
 | `--thread-lookback N` | 30 | How far back to look for thread starters whose replies fall inside the window (see below). |
 | `--out-tokens N` | 1500 | Assumed digest output per business unit per day, used for cost and time. This is a guess, not a measurement. |
 | `--in-price`, `--out-price` | none | USD per million input and output tokens. Give both to get a daily and monthly cost. |
+| `--unassigned-dms` | off | Also measure group DMs that are not assigned (and not left out with an override) and were active in the 30 days before the run, the same set as section 4 of the channel report. They form a separate "Unassigned DMs" bucket; see below. |
 
 The report shows:
 - tokens per day for every day in the window
@@ -71,6 +72,8 @@ The report shows:
 - channels it could not read
 - a local-model time estimate (about 65 tokens/s reading, 12 tokens/s writing, plus how many 8,000-character helper calls a day would take)
 - the cloud cost, if prices are given
+
+**The "Unassigned DMs" bucket** shows how much text sits in group DMs nobody has assigned yet, without mixing it into the decision. It gets its own row in the per-unit table and appears in the top-10 and no-activity lists, but the daily totals and the local and cloud estimates stay assigned-only. One extra line gives the average and peak with the bucket included. In the saved counts file those conversations carry `"unassigned": true`.
 
 It ends with the API call count and the runtime. The counts per channel per day are saved to `data/slack-measure-<date>.json` (git-ignored, mode 600) so runs can be compared.
 
