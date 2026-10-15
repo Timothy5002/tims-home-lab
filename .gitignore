@@ -5,6 +5,11 @@ node_modules/
 *.db-shm
 *.log
 logs/
+# runtime data (channel lists, measurements); only the placeholder is tracked
+data/*
+!data/.gitkeep
+# real Slack business-unit rules (channel IDs, unit names); the example is tracked
+config/slack-bus.json
 .env
 .env.*
 token

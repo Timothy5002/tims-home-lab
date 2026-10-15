@@ -22,7 +22,9 @@ A small service on the home-lab Mac mini that runs **named shell jobs on request
 | `jobs/` | The runnable jobs (`<name>.sh`) | The only things the service can execute. See `jobs/README.md` |
 | `launchd/` | LaunchAgent plist templates | Keep the service and schedules running; one file per agent |
 | `scripts/` | Operator helpers | `install-agent.sh` installs a plist from `launchd/`; `llm-eval.js` checks the LLM prompt templates |
-| `data/` | Runtime data (git-ignored) | Holds `dispatcher.db` |
+| `scripts/slack-channels.js`, `scripts/slack-measure.js`, `scripts/slack-lib.js` | Slack measurement (terminal only) | Count how many tokens a daily Slack digest would read, to choose between the local and a cloud model. See `docs/slack-measurement.md` |
+| `config/` | Settings that are not secrets | `slack-bus.example.json` is the template; the real `slack-bus.json` (Slack channel to business unit rules) is git-ignored |
+| `data/` | Runtime data (everything except `.gitkeep` is git-ignored) | Holds `dispatcher.db`, `slack-channels.json`, `slack-measure-<date>.json` |
 | `docs/` | Detailed documentation | Architecture, operations, adding jobs, design decisions |
 | `CLAUDE.md` | Rules for Claude Code sessions | Binding rules and conventions; humans should read it too |
 
@@ -39,7 +41,8 @@ curl -s -X POST -H "Authorization: Bearer $(cat ~/.lab/token)" localhost:8787/ru
 - **Understand the design:** [docs/architecture.md](docs/architecture.md)
 - **Run and troubleshoot it:** [docs/operations.md](docs/operations.md)
 - **Add a job or a schedule:** [docs/adding-jobs.md](docs/adding-jobs.md)
+- **Measure Slack volume for a digest:** [docs/slack-measurement.md](docs/slack-measurement.md)
 - **Why things are the way they are:** [docs/decisions.md](docs/decisions.md)
 
 ## Secrets
-All secrets live in `~/.lab/` (directory 700, files 600) and never in this repo: `token` and `healthcheck-url-<job>`.
+All secrets live in `~/.lab/` (directory 700, files 600) and never in this repo: `token`, `healthcheck-url-<job>` and `slack-token`.

@@ -10,11 +10,11 @@ Node + Fastify service on this Mac mini that runs named jobs on request. Rules b
 - `GET /health` is the only unauthenticated route.
 - Every request to `/run/:job` is logged to SQLite (`dispatcher.db`: job, source, start time, duration, exit code, status, output), including rejected ones.
 - Runs as a LaunchAgent (`com.lab.dispatcher`, RunAtLoad + KeepAlive). Logs go to `~/Library/Logs/lab-dispatcher/`.
-- `.gitignore` must keep covering `node_modules`, `*.db*`, logs, and secrets. Never commit tokens.
+- `.gitignore` must keep covering `node_modules`, `*.db*`, `data/` (except `.gitkeep`), `config/slack-bus.json`, logs, and secrets. Never commit tokens.
 - Changing any rule above needs the user's explicit approval. Tell the user when something needs sudo or a GUI click; do not work around it.
 
 ## Repository layout (keep it this way)
-- `src/` service code; `jobs/` runnable jobs only; `launchd/` plist templates (the repo copy is the source of truth, installed via `scripts/install-agent.sh`); `scripts/` operator helpers; `data/` git-ignored runtime data; `docs/` documentation.
+- `src/` service code; `jobs/` runnable jobs only; `launchd/` plist templates (the repo copy is the source of truth, installed via `scripts/install-agent.sh`); `scripts/` operator helpers; `config/` non-secret settings (real files with private details are git-ignored, with a tracked `*.example.json`); `data/` git-ignored runtime data; `docs/` documentation.
 - Do not put code, plists or docs in the repo root. The root holds only `README.md`, `CLAUDE.md`, `package.json`, `package-lock.json`, `.gitignore`.
 
 ## Documentation rules
@@ -41,3 +41,10 @@ Node + Fastify service on this Mac mini that runs named jobs on request. Rules b
 - To add a schedule: (1) the job must already exist as `jobs/<name>.sh`; (2) copy `launchd/com.lab.schedule.hello.plist` to `launchd/com.lab.schedule.<name>.plist`, change `Label`, the job argument, the `StartCalendarInterval`, and the log path; (3) create the job's own healthchecks.io check and write its URL to `~/.lab/healthcheck-url-<name>` (`umask 077`, chmod 600); (4) install it with `scripts/install-agent.sh launchd/com.lab.schedule.<name>.plist`.
 - Test with `launchctl kickstart -k gui/$(id -u)/com.lab.schedule.<name>` and read `~/Library/Logs/lab-dispatcher/schedule-<name>.log`. Do not use `RunAtLoad` on schedules.
 - The Mac must stay awake (`pmset` sleep 0; display sleep is fine) and logged in (auto-login is on). Missed runs fire on wake but are skipped if the Mac was powered off; the healthchecks grace period catches that.
+
+## Slack measurement
+- `scripts/slack-channels.js` and `scripts/slack-measure.js` (shared code in `scripts/slack-lib.js`) measure how many tokens a daily Slack digest would read. They run from the terminal, never through the dispatcher (too slow for the 60s limit). Full usage: `docs/slack-measurement.md`.
+- The Slack user token is read only from `~/.lab/slack-token` (mode 600, enforced). Never print it, log it, put it on a command line or in an env var, or commit it.
+- Read-only Slack calls only. The client refuses any method not in its list (`conversations.list/history/replies/members`, `users.list`); do not add a method that writes to Slack.
+- Never write, log or print message text. Only per-channel, per-day counts go to `data/` (git-ignored, files written mode 600).
+- Business-unit rules are in `config/slack-bus.json` (git-ignored; template `config/slack-bus.example.json`). Keep real channel IDs and unit names out of the repo.

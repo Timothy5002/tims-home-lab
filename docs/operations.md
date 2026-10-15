@@ -16,6 +16,7 @@ Optional, for jobs that use the LLM helper: Ollama from Homebrew (`brew services
 |---|---|
 | `~/.lab/token` | API bearer token (600) |
 | `~/.lab/healthcheck-url-<job>` | healthchecks.io ping URL for that job's schedule (600) |
+| `~/.lab/slack-token` | Read-only Slack user token for the Slack measurement scripts (600) |
 | `~/Library/LaunchAgents/com.lab.*.plist` | Installed copies of `launchd/*.plist` |
 | `~/Library/Logs/lab-dispatcher/` | `out.log`, `err.log` (service), `schedule-<job>.log` (scheduled runs) |
 
@@ -28,6 +29,7 @@ launchctl kickstart -k gui/$(id -u)/com.lab.schedule.disk-check            # run
 sqlite3 -header -column data/dispatcher.db "select * from runs order by id desc limit 10"
 node scripts/llm-eval.js                                                   # check the LLM prompt templates
 curl -s 127.0.0.1:11434/api/ps                                             # is the model loaded right now?
+node scripts/slack-channels.js && node scripts/slack-measure.js            # Slack volume; see docs/slack-measurement.md
 ```
 After editing a file in `launchd/`, reinstall it with `scripts/install-agent.sh launchd/<file>.plist`. After editing `src/`, restart the dispatcher with the `kickstart -k` command above.
 
