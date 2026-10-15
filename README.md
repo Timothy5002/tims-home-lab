@@ -25,7 +25,8 @@ A small service on the home-lab Mac mini that runs **named shell jobs on request
 | `scripts/slack-channels.js`, `scripts/slack-measure.js`, `scripts/slack-lib.js` | Slack measurement (terminal only) | Count how many tokens a daily Slack digest would read, to choose between the local and a cloud model. See `docs/slack-measurement.md` |
 | `config/` | Settings that are not secrets | `slack-bus.example.json` is the template; the real `slack-bus.json` (Slack channel to business unit rules) is git-ignored |
 | `data/` | Runtime data (everything except `.gitkeep` is git-ignored) | Holds `dispatcher.db`, `slack-channels.json`, `slack-measure-<date>.json` |
-| `docs/` | Detailed documentation | Architecture, operations, adding jobs, design decisions |
+| `docs/` | Detailed documentation | Architecture, operations, adding jobs, design decisions, Slack digest design |
+| `docs/private/` | Workspace-specific notes (git-ignored) | Real channel names, IDs and open questions that committed docs leave out |
 | `CLAUDE.md` | Rules for Claude Code sessions | Binding rules and conventions; humans should read it too |
 
 ## Quick start
@@ -42,6 +43,7 @@ curl -s -X POST -H "Authorization: Bearer $(cat ~/.lab/token)" localhost:8787/ru
 - **Run and troubleshoot it:** [docs/operations.md](docs/operations.md)
 - **Add a job or a schedule:** [docs/adding-jobs.md](docs/adding-jobs.md)
 - **Measure Slack volume for a digest:** [docs/slack-measurement.md](docs/slack-measurement.md)
+- **Daily Slack digest (design and phases):** [docs/slack-digest-design.md](docs/slack-digest-design.md)
 - **Why things are the way they are:** [docs/decisions.md](docs/decisions.md)
 
 ## Secrets

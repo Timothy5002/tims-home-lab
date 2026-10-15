@@ -10,6 +10,8 @@ data/*
 !data/.gitkeep
 # real Slack business-unit rules (channel IDs, unit names); the example is tracked
 config/slack-bus.json
+# workspace-specific notes and open questions (real names, IDs)
+docs/private/
 .env
 .env.*
 token

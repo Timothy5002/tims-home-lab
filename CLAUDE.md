@@ -10,7 +10,7 @@ Node + Fastify service on this Mac mini that runs named jobs on request. Rules b
 - `GET /health` is the only unauthenticated route.
 - Every request to `/run/:job` is logged to SQLite (`dispatcher.db`: job, source, start time, duration, exit code, status, output), including rejected ones.
 - Runs as a LaunchAgent (`com.lab.dispatcher`, RunAtLoad + KeepAlive). Logs go to `~/Library/Logs/lab-dispatcher/`.
-- `.gitignore` must keep covering `node_modules`, `*.db*`, `data/` (except `.gitkeep`), `config/slack-bus.json`, logs, and secrets. Never commit tokens.
+- `.gitignore` must keep covering `node_modules`, `*.db*`, `data/` (except `.gitkeep`), `config/slack-bus.json`, `docs/private/`, logs, and secrets. Never commit tokens.
 - Changing any rule above needs the user's explicit approval. Tell the user when something needs sudo or a GUI click; do not work around it.
 
 ## Repository layout (keep it this way)
