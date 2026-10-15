@@ -58,3 +58,4 @@ Node + Fastify service on this Mac mini that runs named jobs on request. Rules b
 - **Masking:** before any model call, text from external conversations goes through `src/mask.js`. External means either the unit rule in `config/slack-bus.json` (`external`) or Slack's `is_ext_shared` flag. Only counts of masked items are logged. Quote checks use the masked text.
 - **Retention:** message text stays in memory until the digest is written; only the digest file (`data/digests/`, mode 600) persists. Logs and run rows hold counts, usage and cost, never text.
 - Run `node scripts/digest-selftest.js` after changing masking, the DeepSeek client or bot compression, and keep it passing.
+- Entry point: `node src/digest/run.js` (code lives in `src/digest/`). Hand runs do not move the last-success timestamp unless `--record` is given. The digest file in `data/digests/` (mode 600) is the only output that may contain message text; never print it in a session or log it.

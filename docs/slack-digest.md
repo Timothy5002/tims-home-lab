@@ -1,6 +1,6 @@
 # Slack digest: how to run it
 
-The design, rules and phases are in [slack-digest-design.md](slack-digest-design.md). This page covers what is built and how to run it. **Built so far: phase 0 (groundwork).** Phase 1 adds the code-only digest.
+The design, rules and phases are in [slack-digest-design.md](slack-digest-design.md). This page covers what is built and how to run it. **Built so far: phase 0 (groundwork) and phase 1 (code-only digest, no model calls).**
 
 ## Files and secrets
 | What | Where | Notes |
@@ -35,3 +35,31 @@ Section 6 of that report lists the **external** conversations by unit and sub-gr
 - **Slack's own flag:** Slack marks the conversation as shared with another organization (`is_ext_shared`)
 
 Listings saved before this field was recorded don't have it, and the report says so. The next full channel listing records it, with no extra Slack calls.
+
+## Run the digest (phase 1: code only)
+```bash
+node src/digest/run.js                # window: since the last recorded run (max 72 h), or the last 24 h
+node src/digest/run.js --hours 48     # a fixed window, for testing
+node src/digest/run.js --record       # also record this run as the last success (scheduled runs do this)
+```
+It takes about 5 minutes, because Slack calls are spaced to stay under the rate limits. The steps:
+1. **Fetch** every conversation mapped to a unit. Unassigned group DMs are left out. The fetch reads the window plus a 14-day lookback, so older threads with new replies are found.
+2. **Compress bot posts** in code (`src/digest/compress.js`). Messages from one bot that share a template (the text with numbers, IDs, links and dates replaced) become one line with a count, plus the latest example. Instances with alert words (failed, error, outage, cancel…) are always listed.
+3. **Write** `data/digests/<date>.md` (mode 600, git-ignored):
+   - the customer group first, each active customer with its busiest threads, latest messages from people and compressed bot posts, every item linked to its message
+   - quiet customers on one line, then the other units
+   - a footer: counts, compression ratio, how many tokens phase 2 would send, masking counts from a dry run, API calls and runtime
+
+**Phase 1 makes no model calls.** It masks external text in memory only to count what would be masked, then discards it.
+
+**What persists:**
+- **The digest file:** the only thing written that contains message text.
+- **Counts only, no text:** stdout, the run row in `data/dispatcher.db` (job `slack-digest`, source `manual` or `launchd-direct`) and `data/digest-state.json` (a timestamp).
+
+Settings are in `config/slack-digest.json`:
+- workspace URL for links
+- unit order, and which unit > sub-group is the customer group
+- your display name, which is left out of group DM labels
+- window limits, thread lookback, input cap and run deadline
+
+The run stops by itself after the deadline (25 minutes) and logs `deadline`.

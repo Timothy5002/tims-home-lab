@@ -45,3 +45,7 @@
 | Quote checks use the masked text; links point to the original message | The model only ever saw masked text, so that is what a quote must match; the link lets the reader see the real message in Slack. |
 | One secret reader (`src/secrets.js`) for the Slack and DeepSeek clients | Same mode-600 rule everywhere and one place to fix it. `src/schedule-run.js` keeps its own copy for now, to avoid touching the running scheduler. |
 | Digest settings in `config/slack-digest.json` (git-ignored) | The workspace URL is specific to this workspace; the tracked example documents the format. |
+| Phase 1 of the digest is code-only (no model) | It proves fetching, compression, links, retention and runtime on real data without sending anything anywhere, and measures what phase 2 would send. |
+| Bot posts are compressed by template in code, keeping alert lines | Bots wrote 54% of characters, mostly repeats. Grouping by bot and template (numbers, IDs, links and dates replaced) cuts that without a model, and listing alert-word instances keeps a real failure from being folded into a count. |
+| Hand runs of the digest do not move the "last success" timestamp unless `--record` is given | Testing should never shorten the next scheduled window. |
+| Digest thread lookback is 14 days (the measurement used 30) | Each run reads the lookback for every conversation; 14 days still catches older threads that come back to life, at about half the calls. |

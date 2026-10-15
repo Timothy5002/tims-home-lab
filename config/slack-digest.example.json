@@ -5,5 +5,15 @@
   "maxWindowHours": 72,
   "defaultWindowHours": 24,
   "maxInputTokens": 122000,
-  "runDeadlineMinutes": 25
+  "runDeadlineMinutes": 25,
+  "unitOrder": [
+    "Unit B",
+    "Unit A"
+  ],
+  "customerGroup": {
+    "bu": "Unit B",
+    "sub": "Customers"
+  },
+  "myName": "Your display name",
+  "_keys": "workspaceUrl: for message links. threadLookbackDays: how far back to look for threads with new replies. maxWindowHours/defaultWindowHours: window cap and first-run window. maxInputTokens: per-run cap. runDeadlineMinutes: the run gives up after this. unitOrder: unit order in the digest. customerGroup: the unit > sub-group whose conversations are customers (shown first, quiet ones named). myName: left out of group DM labels."
 }
