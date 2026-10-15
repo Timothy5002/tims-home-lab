@@ -1,6 +1,6 @@
 # Slack digest: design and build plan
 
-**Status.** Phases 0 and 1 are approved; later phases are not. Each later phase is built only after the user approves it.
+**Status.** Phases 0, 1 and 2 are built. Later phases are built only after the user approves each one.
 
 **Workspace details live elsewhere.** This doc names no real channels, business units or people. Those details, plus the open questions, are in `docs/private/` (git-ignored), and the rules themselves are in `config/` (git-ignored, with tracked examples).
 
@@ -126,8 +126,15 @@ A run fetches about 180 conversations (Slack calls spaced 1.3 s apart) and then 
 
 **Links** are built in code from the workspace URL in `config/slack-digest.json`: `<workspace>/archives/<channel>/p<ts without the dot>`. Thread replies add `?thread_ts=<parent>&cid=<channel>`.
 
-## Risk extraction (phase 2, not yet approved)
-**Input, per customer:** the masked messages from the window, compressed, with references, author names and times.
+## Risk extraction (phase 2, built)
+**Input, per customer:** the masked messages from the window, compressed, with references, author names and times. Until phase 4, a customer is one per-customer success channel. Each other sub-group (or a unit without sub-groups) gets one summary call over all its active conversations. Each message's text is sent as a JSON string, under a header that says it is data. Messages longer than 2,000 characters are cut.
+
+**Validation (code, `src/digest/analyze.js`):**
+- An item survives only with a non-empty summary and at least one reference that exists in that call's input. Unknown references are removed, and dropped items are counted.
+- `notable` is decided by code: a customer is notable only if a cited item survived.
+- Model text is sanitized: no URLs, Slack markup, mentions, emails or markdown links, and at most 200 characters.
+- A reply in the wrong shape fails only its own call. A run-level cap (input, output or cost) stops the calls that remain.
+- Before any call, the whole run's estimated input is checked against the cap, and the run aborts if it is over.
 
 **Output (JSON, temperature 0.1, about 1,500 output tokens at most):**
 ```json
@@ -187,7 +194,7 @@ It checks the `notable` flags, the expected issues, that every reference is vali
 |---|---|---|---|
 | 0 | **Groundwork.** Shared Slack client in `src/`, `src/openrouter.js` (key check, pinned providers, no tools, JSON mode, reasoning handling, timeouts, primary/secondary fallback, served-provider check, live prices, caps), masking, external flag | built | `scripts/model-check.js` sends **invented** text to each route and checks model, provider, tokens, cost and JSON shape. Self-tests with invented data cover masking, fallback, caps and every guard |
 | 1 | **Fetch, bot compression, code-only digest** (no model calls) | built | Fetch runtime; compression ratio; masking counts on the would-be input; nothing but the digest on disk; links open the right messages |
-| 2 | **Risk extraction and unit summaries**, plus `scripts/digest-eval.js` | needs approval (data sharing decided) | Eval passes; every claim has a valid reference; the injection is ignored; real cost |
+| 2 | **Risk extraction and unit summaries**, plus `scripts/digest-eval.js` | built | Eval passes; every claim has a valid reference; the injection is ignored; real cost |
 | 3 | **Morning schedule** (standalone launchd) | needs approval and a new healthchecks.io URL | `kickstart` run, both healthcheck pings, run row |
 | 4 | **Customer registry and health** | needs approval | Blocks draw from all of a customer's channels; Red first |
 | 5 | **Leadership-contradiction check** | needs approval and the past cases | Real cases flagged with verified quotes; near-misses not flagged |

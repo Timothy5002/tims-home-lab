@@ -81,18 +81,26 @@ function renderConversation(block, ctx, { threads = 3, latest = 3, botGroups = 5
   return lines.join('\n');
 }
 
-// units: [{ bu, subs: [{ sub, blocks: [...], quiet: [conv], errors: [{ conv, error }] }] }] in display order
+// units: [{ bu, subs: [{ sub, blocks: [...], quiet: [conv], errors: [{ conv, error }], analysis? }] }] in display order.
+// With analysis (phase 2) a sub-group shows model items; without it (--no-model) the code-only blocks.
 function renderDigest({ units, window, footer, ctx, customerKey }) {
   const out = [];
   out.push(`# Slack digest, ${new Date(window.end * 1000).toLocaleString('en-CA', { dateStyle: 'medium', timeStyle: 'short' })}`);
-  out.push(`Window: ${new Date(window.start * 1000).toLocaleString('en-CA', { dateStyle: 'medium', timeStyle: 'short' })} to now (${window.hours.toFixed(1)} h, ${window.reason}).`);
+  out.push(`Window: ${new Date(window.start * 1000).toLocaleString('en-CA', { dateStyle: 'medium', timeStyle: 'short' })} to ${new Date(window.end * 1000).toLocaleString('en-CA', { timeStyle: 'short' })} (${window.hours.toFixed(1)} h, ${window.reason}).`);
   out.push(`Written by: ${ctx.writtenBy ?? 'code only (no model)'}.`);
-  out.push('');
-  out.push('_Code-only preview (phase 1). No model was used: this shows activity, thread starters, the latest messages and compressed bot posts, each with a link. Risk extraction comes in phase 2._');
+  if (!ctx.analyzed) {
+    out.push('', '_Code-only digest: no model was used. It shows activity, thread starters, the latest messages and compressed bot posts, each with a link._');
+  } else {
+    out.push('', '_Every item links to the messages it is based on. Items without a valid source were dropped._');
+  }
   for (const u of units) {
     out.push('', `## ${u.bu}`);
     for (const s of u.subs) {
       const isCustomers = customerKey && u.bu === customerKey.bu && s.sub === customerKey.sub;
+      if (ctx.analyzed) {
+        out.push(...(isCustomers ? renderCustomers(s, ctx) : renderUnitSummary(s, ctx)));
+        continue;
+      }
       const title = s.sub ?? '(no sub-group)';
       out.push('', `### ${title}: ${s.blocks.length} active${s.quiet.length ? `, ${s.quiet.length} quiet` : ''}`);
       const opts = isCustomers ? {} : { threads: 2, latest: 2, botGroups: 3 };
@@ -104,6 +112,71 @@ function renderDigest({ units, window, footer, ctx, customerKey }) {
   }
   out.push('', '---', ...footer);
   return `${out.join('\n')}\n`;
+}
+
+// Links for an item's references, numbered within the item. Built from the reference map, never from model text.
+function refLinks(refs, refMap, ctx) {
+  return refs.map((r, i) => {
+    const m = refMap.get(r);
+    return `[${i + 1}](${permalink(ctx.workspaceUrl, m.conv, m.ts, m.threadTs)})`;
+  }).join(' ');
+}
+
+const count = (b) => b.compressed.stats.messagesIn;
+const LEVEL_ORDER = { high: 0, medium: 1, low: 2 };
+
+function renderCustomers(s, ctx) {
+  const out = [];
+  const results = s.analysis ?? new Map();
+  const notable = [];
+  const nothing = [];
+  const failed = [];
+  const notSent = [];
+  for (const b of s.blocks) {
+    if (b.conv.noCloud) { notSent.push(b); continue; }
+    const r = results.get(b.conv.id);
+    if (!r || !r.ok) failed.push({ b, error: r?.error ?? 'not analyzed' });
+    else if (r.notable) notable.push({ b, r });
+    else nothing.push(b);
+  }
+  const top = (r) => Math.min(...[...r.wentWrong, ...r.risks].map((i) => LEVEL_ORDER[i.severity ?? i.likelihood] ?? 1));
+  notable.sort((x, y) => top(x.r) - top(y.r) || count(y.b) - count(x.b));
+  out.push('', `### ${s.sub ?? 'Customers'}: ${notable.length} with something notable, ${nothing.length} active with nothing notable, ${s.quiet.length} quiet`);
+  for (const { b, r } of notable) {
+    out.push('', `#### ${convLabel(b.conv, ctx.me)}${b.conv.external ? ' (external)' : ''}: ${count(b)} messages`);
+    if (r.wentWrong.length) {
+      out.push('What went wrong:');
+      for (const i of r.wentWrong) out.push(`- [${i.severity}] ${i.summary} ${refLinks(i.refs, r.refMap, ctx)}`);
+    }
+    if (r.risks.length) {
+      out.push('Potential risks:');
+      for (const i of r.risks) out.push(`- [${i.likelihood}] ${i.summary} ${refLinks(i.refs, r.refMap, ctx)}`);
+    }
+  }
+  if (nothing.length) out.push('', `Nothing notable: ${nothing.map((b) => `${convLabel(b.conv, ctx.me)} (${count(b)})`).join(', ')}`);
+  if (s.quiet.length) out.push('', `Quiet: ${s.quiet.map((c) => convLabel(c, ctx.me)).join(', ')}`);
+  if (notSent.length) out.push('', `Not summarized (noCloud): ${notSent.map((b) => `${convLabel(b.conv, ctx.me)} (${count(b)} messages)`).join(', ')}`);
+  if (failed.length) out.push('', `Not analyzed: ${failed.map(({ b, error }) => `${convLabel(b.conv, ctx.me)} (${count(b)} messages; ${error})`).join(', ')}`);
+  if (s.errors.length) out.push('', `Could not read: ${s.errors.map((e) => `${convLabel(e.conv, ctx.me)} (${e.error})`).join(', ')}`);
+  return out;
+}
+
+function renderUnitSummary(s, ctx) {
+  const out = [];
+  const sent = s.blocks.filter((b) => !b.conv.noCloud);
+  const notSent = s.blocks.filter((b) => b.conv.noCloud);
+  out.push('', `### ${s.sub ?? '(no sub-group)'}: ${s.blocks.length} active${s.quiet.length ? `, ${s.quiet.length} quiet` : ''}`);
+  const r = s.analysis;
+  if (sent.length && r?.ok) {
+    if (r.points.length) for (const p of r.points) out.push(`- ${p.summary} ${refLinks(p.refs, r.refMap, ctx)}`);
+    else out.push('- Nothing notable.');
+  } else if (sent.length) {
+    out.push(`- Not analyzed (${r?.error ?? 'not analyzed'}).`);
+  }
+  if (sent.length) out.push(`Active: ${sent.map((b) => `${convLabel(b.conv, ctx.me)} (${count(b)})`).join(', ')}`);
+  if (notSent.length) out.push(`Not summarized (noCloud): ${notSent.map((b) => `${convLabel(b.conv, ctx.me)} (${count(b)} messages)`).join(', ')}`);
+  if (s.errors.length) out.push(`Could not read: ${s.errors.map((e) => `${convLabel(e.conv, ctx.me)} (${e.error})`).join(', ')}`);
+  return out;
 }
 
 module.exports = { renderDigest, renderConversation, snippet, convLabel };

@@ -284,6 +284,65 @@ const hang = (init) => new Promise((_, reject) => {
     check('openrouter: JSON mode requires the word json in the prompt', e3?.code === 'bad-request');
   }
 
+  // ---------- Phase 2: preparation, validation, sanitizing, caps, links (invented data, stubbed model) ----------
+  {
+    const { prepare, validate, sanitize, analyzeAll } = require('../src/digest/analyze');
+    const { renderDigest } = require('../src/digest/render');
+    const ext = { id: 'C-EXT', external: true };
+    const int = { id: 'C-INT', external: false };
+    const counts = newCounts();
+    const { lines, refMap } = prepare([
+      { conv: ext, ts: '100.000001', who: 'Pat', text: 'mail pat@example.test, call 555-123-4567' },
+      { conv: int, ts: '200.000002', who: 'Sam', text: 'mail sam@example.test, key sk-abcdefghijklmnop1234', threadTs: '150.000000' },
+    ], counts);
+    check('phase2: references m001.. map to conversation and timestamp', lines[0].ref === 'm001' && refMap.get('m002').conv === 'C-INT' && refMap.get('m002').threadTs === '150.000000');
+    check('phase2: external text fully masked, internal only secrets, names kept',
+      lines[0].text === 'mail [email], call [phone]' && lines[1].text === 'mail sam@example.test, key [secret]' && lines[0].who === 'Pat' && counts.email === 1 && counts.secret === 1, JSON.stringify(lines));
+    const v = validate('customer', {
+      went_wrong: [
+        { summary: 'Calls dropped', severity: 'HIGH', refs: ['m001', 'm999'] },
+        { summary: 'Invented with no source', severity: 'high', refs: [] },
+        { summary: 'Made-up reference', severity: 'low', refs: ['m777'] },
+      ],
+      risks: [{ summary: '  ', likelihood: 'high', refs: ['m002'] }],
+      notable: true,
+    }, refMap);
+    check('phase2: only cited items survive; unknown refs removed; drops counted',
+      v.wentWrong.length === 1 && v.wentWrong[0].refs.join() === 'm001' && v.wentWrong[0].severity === 'high' && v.risks.length === 0 && v.dropped === 3, JSON.stringify(v));
+    const v2 = validate('customer', { went_wrong: [{ summary: 'x', refs: ['m404'] }], risks: [], notable: true }, refMap);
+    check('phase2: "notable" is decided by code, not the model', v2.notable === false && v2.dropped === 1);
+    const six = Array.from({ length: 6 }, (_, i) => ({ summary: `p${i}`, refs: ['m001'] }));
+    check('phase2: at most 5 items per list', validate('unit', { points: six }, refMap).points.length === 5);
+    let shapeErr = null;
+    try { validate('customer', { went_wrong: 'oops' }, refMap); } catch (e) { shapeErr = e.code; }
+    check('phase2: a wrong shape is rejected', shapeErr === 'bad-shape');
+    const dirty = 'See <https://evil.test/x|here>, [click](https://evil.test) or https://evil.test/a and www.evil.test, ping <@U123> <!channel> @everyone, mail a@b.test';
+    const clean = sanitize(dirty);
+    check('phase2: model text loses links, mentions, emails and markup', !/https?:|www\.|evil\.test|<|@|\]\(/.test(clean), clean);
+    // Links come only from the reference map.
+    const res = new Map([['C-EXT', { ok: true, notable: true, refMap, dropped: 0,
+      wentWrong: [{ summary: sanitize('Outage https://evil.test'), severity: 'high', refs: ['m002'] }], risks: [] }]]);
+    const md = renderDigest({
+      units: [{ bu: 'Unit B', subs: [{ sub: 'Customers', blocks: [{ conv: { id: 'C-EXT', name: 'success-acme', type: 'public', external: false }, compressed: { stats: { messagesIn: 3 } } }], quiet: [], errors: [], analysis: res }] }],
+      window: { start: 0, end: 86400, hours: 24, reason: 'test' }, footer: [],
+      ctx: { workspaceUrl: 'https://ws.example.test', analyzed: true, writtenBy: 'model X via Provider Y', nameOf: () => '' }, customerKey: { bu: 'Unit B', sub: 'Customers' },
+    });
+    const urls = md.match(/https?:\/\/[^\s)]+/g) ?? [];
+    check('phase2: every link in the digest is a code-built Slack link',
+      urls.length === 1 && urls[0] === 'https://ws.example.test/archives/C-INT/p200000002?thread_ts=150.000000&cid=C-INT' && md.includes('Written by: model X via Provider Y'), urls.join(' '));
+    // A run-level cap stops the remaining calls; a bad reply shape fails only its own job.
+    const jobs = [0, 1, 2].map((i) => ({ kind: 'unit', key: `k${i}`, header: 'h', messages: [{ conv: int, ts: `${i}.0`, who: 'x', text: 'y' }] }));
+    let n = 0;
+    const stub = async () => {
+      n++;
+      if (n === 1) return { route: 'primary', model: 'm', provider: 'P', json: { points: 'nope' }, usage: {}, costUsd: 0 };
+      const e = new Error('cap'); e.code = 'cost-cap'; throw e;
+    };
+    const out = await analyzeAll(jobs, { routes: {}, budget: null, maskCounts: newCounts(), concurrency: 1, chatImpl: stub });
+    check('phase2: bad shape fails one job; a cost cap stops the rest without calling',
+      out[0].error === 'bad-shape' && out[1].error === 'cost-cap' && out[2].error === 'not sent: cost-cap' && n === 2, JSON.stringify(out.map((o) => o.error)));
+  }
+
   // ---------- Bot compression (added with phase 1) ----------
   let compress;
   try { ({ compressBots: compress } = require('../src/digest/compress')); } catch { /* not built yet */ }

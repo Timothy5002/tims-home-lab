@@ -1,6 +1,6 @@
 # Slack digest: how to run it
 
-The design, rules and phases are in [slack-digest-design.md](slack-digest-design.md). This page covers what is built and how to run it. **Built so far: phase 0 (groundwork) and phase 1 (code-only digest, no model calls).**
+The design, rules and phases are in [slack-digest-design.md](slack-digest-design.md). This page covers what is built and how to run it. **Built so far: phases 0, 1 and 2** (groundwork, the fetch and code-only digest, and model analysis).
 
 ## Files and secrets
 | What | Where | Notes |
@@ -69,9 +69,11 @@ The listing also records Slack's "shared with another organization" flag, and th
 node src/digest/run.js --from 2026-10-14T03:44:36Z --to 2026-10-15T03:44:37Z --mask-report
 ```
 
-## Run the digest (phase 1: code only)
+## Run the digest
 ```bash
 node src/digest/run.js                # window: since the last recorded run (max 72 h), or the last 24 h
+node src/digest/run.js --no-model     # code-only digest (no model calls)
+node src/digest/run.js --reasoning    # turn the primary model's reasoning on (off by default)
 node src/digest/run.js --hours 48     # a fixed window, for testing
 node src/digest/run.js --record       # also record this run as the last success (scheduled runs do this)
 node src/digest/run.js --from <ISO> --to <ISO>   # a fixed window (never recorded)
@@ -84,7 +86,21 @@ It takes about 5 minutes, because Slack calls are spaced to stay under the rate 
    - quiet customers on one line, then the other units
    - a footer: counts, compression ratio, how many tokens phase 2 would send, masking counts from a dry run, API calls and runtime
 
-**Phase 1 makes no model calls.** It masks text in memory only to count what would be masked (secrets everywhere, everything else in external conversations), then discards it. The digest header says what wrote it, which for phase 1 is code only.
+**With the model (the default):**
+- **Calls:** one call per active customer (each per-customer success channel) for "what went wrong" and "potential risks", and one per other active sub-group for a short summary. They go through the primary route, falling back to the secondary only per the rules, at most 3 at a time.
+- **Masking:** text is masked before sending (see below).
+- **Validation:** code checks every reply. Items without a valid message reference are dropped and counted, model text is stripped of links and mentions, and every link is built in code.
+- **The digest header** names the model and provider that wrote it, and says so if any call fell back to the secondary.
+- **Stdout and the run row** hold stats only: conversations summarized, items kept and dropped, masked items by type, tokens (input, output, reasoning), cost against the cap, runtime, and calls per model and provider. The digest text is never printed or logged.
+
+**With `--no-model`:** it masks text in memory only to count what would be masked, then discards it, and writes the code-only digest.
+
+## Digest prompts and their eval
+The prompts are in `src/digest/prompts.js`. After changing one, run:
+```bash
+node scripts/digest-eval.js
+```
+It runs invented sample days through both routes separately and prints pass/fail side by side. The days cover an outage, a quiet day, an alert hidden in bot posts, implicit frustration, sarcasm, an injection attempt and a unit summary. It uses the same preparation and validation as a real run, and a case also fails if any item was dropped for a bad reference. The primary route must pass every case; the secondary's results are informational. It costs well under a cent.
 
 **What persists:**
 - **The digest file:** the only thing written that contains message text.

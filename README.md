@@ -26,9 +26,10 @@ A small service on the home-lab Mac mini that runs **named shell jobs on request
 | `src/secrets.js` | Reads `~/.lab/<name>` with the mode-600 check | One secret check for every client |
 | `src/openrouter.js` | OpenRouter client (cloud models for the Slack digest) | Primary and secondary model routes, each pinned to one provider; fallback in code; served-provider check; live prices; input, output and cost caps; see `docs/slack-digest.md` |
 | `src/mask.js` | Masks secrets (every conversation) and emails, phones, long numbers and URLs with tokens (external conversations) | Applied before any text goes to a model |
-| `src/digest/` | The daily Slack digest: `run.js` (entry point), `fetch.js`, `compress.js` (bot posts, in code), `render.js` | Phase 1 writes a code-only digest to `data/digests/`; see `docs/slack-digest.md` |
+| `src/digest/` | The daily Slack digest: `run.js` (entry point), `fetch.js`, `compress.js` (bot posts, in code), `analyze.js` (model calls and validation), `prompts.js` (prompt templates), `render.js` | Writes the digest to `data/digests/` (mode 600); see `docs/slack-digest.md` |
 | `scripts/slack-channels.js`, `scripts/slack-measure.js` | Slack measurement (terminal only) | Count how many tokens a daily Slack digest would read, to choose between the local and a cloud model. See `docs/slack-measurement.md` |
 | `scripts/model-check.js` | Live check of each model route: model, served provider, tokens, cost, JSON shape | Uses invented text only; `--dry-run` shows request bodies and live prices without calling |
+| `scripts/digest-eval.js` | Eval of the digest prompts on invented sample days, both model routes side by side | Run after changing `src/digest/prompts.js`; the primary must pass |
 | `scripts/digest-selftest.js` | Self-tests for masking, the OpenRouter client (fallback, caps, guards) and bot compression | Invented data, no network; run after changing any of them |
 | `config/` | Settings that are not secrets | `slack-bus.example.json` is the template; the real `slack-bus.json` (Slack channel to business unit rules) is git-ignored |
 | `data/` | Runtime data (everything except `.gitkeep` is git-ignored) | Holds `dispatcher.db`, `slack-channels.json`, `slack-measure-<date>.json`, `digests/` (mode 600) and `digest-state.json` |

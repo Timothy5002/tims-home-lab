@@ -1,8 +1,8 @@
 'use strict';
-// Runs the daily Slack digest. Phase 1 (this version): fetch every conversation mapped to a business unit for the
-// window, compress bot posts in code, and render a code-only digest to data/digests/<date>.md (mode 600). It makes
-// NO model calls; it only measures what would be sent (estimated tokens, and masking counts for external
-// conversations) so phase 2 can be judged against real numbers. See docs/slack-digest.md.
+// Runs the daily Slack digest: fetch every conversation mapped to a business unit for the window, compress bot posts
+// in code, then (phase 2) ask the pinned cloud model for risks per customer and a short summary per sub-group
+// (src/digest/analyze.js), and render data/digests/<date>.md (mode 600). --no-model gives the phase 1 code-only
+// digest. See docs/slack-digest.md.
 //
 // Window: since the last recorded successful run, capped at maxWindowHours; with no record, the last
 // defaultWindowHours. Hand runs do not move the record unless --record is given.
@@ -10,7 +10,7 @@
 // Retention: message text lives in memory only. The digest file is the only thing written that contains text;
 // stdout, the run row in data/dispatcher.db and data/digest-state.json hold counts and timestamps only.
 //
-// Usage: node src/digest/run.js [--hours N] [--record] [--scheduled]
+// Usage: node src/digest/run.js [--hours N] [--record] [--scheduled] [--no-model] [--reasoning]
 //        node src/digest/run.js --from <ISO time> --to <ISO time> [--mask-report]
 //   --from/--to    a fixed window (testing; never recorded as a success)
 //   --mask-report  no digest: print which masking pattern fired on which message (pattern name, conversation ID,
@@ -23,6 +23,9 @@ const { fetchConversation } = require('./fetch');
 const { compressBots } = require('./compress');
 const { renderDigest, convLabel } = require('./render');
 const { maskText, maskSecrets, newCounts, MASK_TYPES } = require('../mask');
+const { loadRoutes, createBudget, estimateTokens } = require('../openrouter');
+const { analyzeAll } = require('./analyze');
+const { CUSTOMER_SYSTEM, UNIT_SYSTEM } = require('./prompts');
 
 const DIGEST_CONFIG = path.join(ROOT, 'config', 'slack-digest.json');
 const STATE_FILE = path.join(DATA_DIR, 'digest-state.json');
@@ -45,6 +48,9 @@ function loadDigestConfig() {
     myName: c.myName ?? null,               // left out of group DM labels
     // Conversation IDs never sent to any model; the digest shows them as "not summarized" with counts only.
     noCloud: new Set(Array.isArray(c.noCloud) ? c.noCloud : []),
+    models: c.models,                       // primary / secondary routes (src/openrouter.js)
+    maxOutputTokens: num('maxOutputTokens', 60_000),
+    maxRunCostUsd: num('maxRunCostUsd', 0.5),
   };
 }
 
@@ -67,6 +73,8 @@ function readState() {
     from: { type: 'string' },
     to: { type: 'string' },
     'mask-report': { type: 'boolean', default: false },
+    'no-model': { type: 'boolean', default: false },
+    reasoning: { type: 'boolean', default: false },
     record: { type: 'boolean', default: false },
     scheduled: { type: 'boolean', default: false },
   } });
@@ -75,7 +83,8 @@ function readState() {
   const record = (opts.record || opts.scheduled) && !fixedWindow && !opts['mask-report'];
   const { logRun } = require('../db');
   // servedBy names the model and provider that wrote the digest; phase 1 is code only.
-  const summary = { phase: 1, modelCalls: 0, servedBy: 'code only (no model)' };
+  const useModel = !opts['no-model'] && !opts['mask-report'];
+  const summary = { phase: useModel ? 2 : 1, modelCalls: 0, servedBy: 'code only (no model)' };
   const finish = (status, exitCode) => {
     summary.runtimeS = Math.round((Date.now() - started) / 1000);
     logRun({ job: 'slack-digest', source, startedAt, durationMs: Date.now() - started, exitCode, status, output: JSON.stringify(summary) });
@@ -152,7 +161,7 @@ function readState() {
       // no model calls). noCloud conversations are never sent, so they are not measured either.
       if (conv.noCloud) {
         if (compressed.stats.messagesIn) totals.noCloudConversations++;
-      } else {
+      } else if (!useModel) {
         const wouldSend = [...compressed.humans, ...compressed.botGroups.flatMap((g) => [...g.examples, ...g.alerts])];
         for (const m of wouldSend) {
           const onHit = (type, pattern) => { if (type === 'secret') secretHits.push({ pattern, conv: conv.id, ts: m.ts }); };
@@ -201,10 +210,86 @@ function readState() {
       };
     });
 
+    // Phase 2: one call per active customer, one per other active sub-group. noCloud conversations are never sent.
+    let modelLines = [];
+    if (useModel) {
+      const routes = loadRoutes(cfg.models);
+      const toMessages = (b, where) => [
+        ...b.compressed.humans.map((m) => ({ ts: m.ts, threadTs: m.threadTs, who: ctx.nameOf(m.user), text: m.text })),
+        ...b.compressed.botGroups.flatMap((g) => [...g.examples, ...g.alerts].map((m) => ({
+          ts: m.ts, threadTs: m.threadTs, who: `${g.botName ?? 'bot'} (bot${g.count > 1 ? `, ${g.count} similar posts` : ''})`, text: m.text,
+        }))),
+      ].map((m) => ({ ...m, conv: { id: b.conv.id, external: b.conv.external }, where }));
+      const jobs = [];
+      for (const u of units) {
+        for (const sub of u.subs) {
+          const sendable = sub.blocks.filter((b) => !b.conv.noCloud);
+          if (!sendable.length) continue;
+          if (cg && u.bu === cg.bu && sub.sub === cg.sub) {
+            for (const b of sendable) {
+              jobs.push({ kind: 'customer', key: b.conv.id, sub, header: `Customer channel: ${convLabel(b.conv, cfg.myName)}.`,
+                messages: toMessages(b, null).sort((x, y) => Number(x.ts) - Number(y.ts)) });
+            }
+          } else {
+            const msgs = sendable.flatMap((b) => toMessages(b, convLabel(b.conv, cfg.myName))).sort((x, y) => Number(x.ts) - Number(y.ts));
+            jobs.push({ kind: 'unit', key: `${u.bu} > ${sub.sub ?? '-'}`, sub,
+              header: `Unit: ${u.bu}. Sub-group: ${sub.sub ?? '(none)'}. Conversations: ${sendable.map((b) => convLabel(b.conv, cfg.myName)).join(', ')}.`, messages: msgs });
+          }
+        }
+      }
+      // Whole-run check before any call: estimated input for every call (prompts included) against the cap.
+      const estimate = jobs.reduce((t, j) => t + estimateTokens(j.kind === 'customer' ? CUSTOMER_SYSTEM : UNIT_SYSTEM)
+        + estimateTokens(j.messages.map((m) => m.text).join('\n')) + j.messages.length * 12, 0);
+      summary.estimatedInputTokens = estimate;
+      if (estimate > cfg.maxInputTokens) {
+        throw new Error(`estimated model input ${estimate} tokens is over the per-run cap of ${cfg.maxInputTokens}; no model calls made`);
+      }
+      const budget = createBudget({ maxInputTokens: cfg.maxInputTokens, maxOutputTokens: cfg.maxOutputTokens, maxCostUsd: cfg.maxRunCostUsd });
+      let done = 0;
+      const results = await analyzeAll(jobs, {
+        routes, budget, maskCounts, reasoning: opts.reasoning,
+        onDone: (r) => process.stderr.write(`  model [${++done}/${jobs.length}] ${r.kind} ${r.ok ? 'ok' : r.error}${r.fellBack ? ' (secondary)' : ''}\n`),
+      });
+      for (const [i, j] of jobs.entries()) {
+        if (j.kind === 'customer') (j.sub.analysis ??= new Map()).set(j.key, results[i]);
+        else j.sub.analysis = results[i];
+      }
+      // Which model and provider served, per call; no text.
+      const served = {};
+      for (const r of results) if (r.provider) served[`${r.model} via ${r.provider}`] = (served[`${r.model} via ${r.provider}`] ?? 0) + 1;
+      const ok = results.filter((r) => r.ok);
+      const kept = ok.reduce((t, r) => t + (r.wentWrong?.length ?? 0) + (r.risks?.length ?? 0) + (r.points?.length ?? 0), 0);
+      const dropped = ok.reduce((t, r) => t + r.dropped, 0);
+      const fellBack = results.filter((r) => r.fellBack).length;
+      // Why the primary was given up on (error codes only), so frequent fallbacks are visible.
+      const fallbackReasons = {};
+      for (const r of results) if (r.fellBack) fallbackReasons[r.primaryError] = (fallbackReasons[r.primaryError] ?? 0) + 1;
+      const convsSummarized = jobs.reduce((t, j, idx) => t + (results[idx].ok ? new Set(j.messages.map((m) => m.conv.id)).size : 0), 0);
+      Object.assign(summary, {
+        modelCalls: results.length, callsOk: ok.length, callsFailed: results.length - ok.length,
+        failures: Object.fromEntries([...new Set(results.filter((r) => !r.ok).map((r) => r.error))].map((e) => [e, results.filter((r) => r.error === e).length])),
+        conversationsSummarized: convsSummarized, customersNotable: ok.filter((r) => r.kind === 'customer' && r.notable).length,
+        itemsKept: kept, itemsDropped: dropped, fallbacks: fellBack, fallbackReasons, servedBy: served,
+        tokens: { input: budget.used.inputTokens, output: budget.used.outputTokens, reasoning: budget.used.reasoningTokens },
+        costUsd: Number(budget.used.costUsd.toFixed(6)), costCapUsd: cfg.maxRunCostUsd,
+      });
+      ctx.analyzed = true;
+      const names = Object.entries(served);
+      ctx.writtenBy = names.length === 0 ? 'no model call succeeded'
+        : names.length === 1 && !fellBack ? names[0][0]
+          : names.map(([n, c]) => `${n} (${c} ${c === 1 ? 'call' : 'calls'})`).join('; ') + (fellBack ? `; ${fellBack} fell back to the secondary` : '');
+      modelLines = [
+        `- Model: ${ctx.writtenBy}. Calls ${results.length} (${ok.length} ok${results.length - ok.length ? `, ${results.length - ok.length} failed` : ''}).${fellBack ? ` Fallback reasons: ${Object.entries(fallbackReasons).map(([k, v]) => `${k} ${v}`).join(', ')}.` : ''}`,
+        `- Items kept ${kept}, dropped for missing or invalid references ${dropped}.`,
+        `- Tokens: input ${budget.used.inputTokens.toLocaleString('en-US')}, output ${budget.used.outputTokens.toLocaleString('en-US')} (reasoning ${budget.used.reasoningTokens}). Cost $${budget.used.costUsd.toFixed(4)} of a $${cfg.maxRunCostUsd} cap.`,
+        `- Masked before sending (secrets in every conversation, the rest in external ones): ${MASK_TYPES.map((t) => `${t} ${maskCounts[t]}`).join(', ')}.`,
+      ];
+    }
+
     const wouldSendTokens = Math.ceil(totals.wouldSendChars / 4); // same characters / 4 estimate as the measurement
     const s = slack.stats;
     Object.assign(summary, totals, {
-      wouldSendTokens, underCap: wouldSendTokens <= cfg.maxInputTokens, masked: maskCounts,
+      ...(useModel ? {} : { wouldSendTokens, underCap: wouldSendTokens <= cfg.maxInputTokens }), masked: maskCounts,
       compressionRatio: totals.charsIn ? Number((totals.charsOut / totals.charsIn).toFixed(3)) : null,
       apiCalls: s.calls, rateLimitWaits: s.rateLimited,
     });
@@ -212,10 +297,12 @@ function readState() {
       `- Window: ${window.hours.toFixed(1)} h (${reason}); thread lookback ${cfg.threadLookbackDays} days.`,
       `- Conversations: ${targets.length} mapped, ${totals.activeConversations} active (${totals.externalConversations} of them external), ${totals.errors} unreadable.`,
       `- Messages: ${totals.messages} (${totals.botMessages} from bots). Characters ${totals.charsIn.toLocaleString('en-US')} → ${totals.charsOut.toLocaleString('en-US')} after bot compression (${summary.compressionRatio === null ? '-' : Math.round(summary.compressionRatio * 100)}%).`,
-      `- Would send to a model (phase 2): about ${wouldSendTokens.toLocaleString('en-US')} tokens before prompts; cap ${cfg.maxInputTokens.toLocaleString('en-US')}${summary.underCap ? '' : ' (OVER CAP: the run would abort)'}.`,
-      `- Masking dry run (secrets in every conversation, the rest in external ones): ${MASK_TYPES.map((t) => `${t} ${maskCounts[t]}`).join(', ')}. Nothing was sent.`,
+      ...(useModel ? modelLines : [
+        `- Would send to a model: about ${wouldSendTokens.toLocaleString('en-US')} tokens before prompts; cap ${cfg.maxInputTokens.toLocaleString('en-US')}${summary.underCap ? '' : ' (OVER CAP: the run would abort)'}.`,
+        `- Masking dry run (secrets in every conversation, the rest in external ones): ${MASK_TYPES.map((t) => `${t} ${maskCounts[t]}`).join(', ')}. Nothing was sent.`,
+      ]),
       `- Not sent to any model by choice (noCloud): ${totals.noCloudConversations} active ${totals.noCloudConversations === 1 ? 'conversation' : 'conversations'}.`,
-      `- Slack API calls: ${s.calls}, rate-limit waits: ${s.rateLimited}. Model calls: 0. Runtime: ${Math.round((Date.now() - started) / 1000)} s.`,
+      `- Slack API calls: ${s.calls}, rate-limit waits: ${s.rateLimited}. Runtime: ${Math.round((Date.now() - started) / 1000)} s.`,
     ];
     const text = renderDigest({ units, window, footer, ctx, customerKey: cg });
     const file = path.join(DIGEST_DIR, `${localDay(new Date(now * 1000))}.md`);
