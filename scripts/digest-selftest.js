@@ -1,7 +1,9 @@
 'use strict';
 // Self-tests for the Slack digest's guard code, using invented text only: masking (src/mask.js), the OpenRouter
-// client's guards and primary/secondary fallback (src/openrouter.js, with a fake API so nothing leaves the Mac),
-// the secret-file check, and bot compression (src/digest/compress.js). Run after changing any of them: node scripts/digest-selftest.js
+// client's guards, primary retry and primary/secondary fallback (src/openrouter.js, with a fake API so nothing
+// leaves the Mac), the run and per-call caps (src/digest/analyze.js), the send-only Slack client and the DM
+// (src/slack-send.js, src/digest/dm.js, fake Slack), the healthcheck helper, the secret-file check, and bot
+// compression (src/digest/compress.js). Run after changing any of them: node scripts/digest-selftest.js
 // Prints one line per case; exits non-zero if any case fails.
 const fs = require('node:fs');
 const os = require('node:os');
@@ -208,16 +210,54 @@ const hang = (init) => new Promise((_, reject) => {
     ['429', json(429, {}), 'rate-limited'],
     ['provider mismatch', { content: '{"ok":true}', provider: 'SomeOtherProvider' }, 'provider-mismatch'],
   ]) {
-    const f = fakeOpenRouter([first, { content: '{"ok":2}', provider: 'Google', cost: 0.0001 }]);
+    // Transient errors get one primary retry first; a provider mismatch goes straight to the secondary.
+    const retries = code !== 'provider-mismatch';
+    const f = fakeOpenRouter(retries ? [first, first, { content: '{"ok":2}', provider: 'Google', cost: 0.0001 }] : [first, { content: '{"ok":2}', provider: 'Google', cost: 0.0001 }]);
     const r = await chat({ ...base, fetchImpl: f, timeoutMs: 50 });
-    check(`openrouter: ${label} on primary -> one attempt on secondary`,
-      r.route === 'secondary' && r.fellBack && r.primaryError === code && r.provider === 'Google' && f.calls.chat.length === 2
-      && f.calls.chat[1].body.model === 'google/gemini-3.8-flash' && f.calls.chat[0].body.model === 'deepseek/deepseek-v3.2', JSON.stringify({ r, n: f.calls.chat.length }));
+    const n = retries ? 3 : 2;
+    check(`openrouter: ${label} on primary${retries ? ' twice (one retry)' : ', no retry'} -> one attempt on secondary`,
+      r.route === 'secondary' && r.fellBack && r.primaryError === code && r.provider === 'Google' && f.calls.chat.length === n
+      && JSON.stringify(r.primaryErrors) === JSON.stringify(retries ? [code, code] : [code])
+      && f.calls.chat[n - 1].body.model === 'google/gemini-3.8-flash' && f.calls.chat.slice(0, n - 1).every((c) => c.body.model === 'deepseek/deepseek-v3.2'), JSON.stringify({ r, n: f.calls.chat.length }));
+  }
+  for (const [label, first, code] of [['timeout', hang, 'timeout'], ['5xx', json(502, {}), 'server-error'], ['429', json(429, {}), 'rate-limited']]) {
+    const slept = [];
+    const f = fakeOpenRouter([first, { content: '{"ok":1}', provider: 'DeepInfra', cost: 0.00001 }]);
+    const r = await chat({ ...base, fetchImpl: f, timeoutMs: 50, sleepImpl: async (ms) => { slept.push(ms); } });
+    check(`openrouter: ${label} then success -> recovered on the primary retry after a backoff, no fallback`,
+      r.route === 'primary' && !r.fellBack && r.retried && r.primaryErrors[0] === code && f.calls.chat.length === 2 && slept[0] === 3000,
+      JSON.stringify({ route: r.route, slept, n: f.calls.chat.length }));
   }
   {
-    const f = fakeOpenRouter([json(503, {}), json(503, {}), { content: '{}', provider: 'Google' }]);
+    const slept = [];
+    const f = fakeOpenRouter([json(429, {}, { 'retry-after': '60' }), { content: '{}', provider: 'DeepInfra' }]);
+    await chat({ ...base, fetchImpl: f, sleepImpl: async (ms) => { slept.push(ms); } });
+    check('openrouter: Retry-After is honored but capped at 10 s', slept[0] === 10_000, JSON.stringify(slept));
+  }
+  {
+    const f = fakeOpenRouter([json(503, {}), json(503, {}), json(503, {}), { content: '{}', provider: 'Google' }]);
     const e = await errOf(chat({ ...base, fetchImpl: f }));
-    check('openrouter: never a third attempt', e?.code === 'server-error' && f.calls.chat.length === 2, `${e?.code} after ${f.calls.chat.length} requests`);
+    check('openrouter: never a fourth attempt (primary, retry, secondary)', e?.code === 'server-error' && f.calls.chat.length === 3
+      && e.fellBack && JSON.stringify(e.primaryErrors) === '["server-error","server-error"]', `${e?.code} after ${f.calls.chat.length} requests`);
+    const f2 = fakeOpenRouter([json(503, {}), json(401, {}), { content: '{}', provider: 'Google' }]);
+    const e2 = await errOf(chat({ ...base, fetchImpl: f2 }));
+    check('openrouter: a retry that fails with a non-fallback error does not fall back', e2?.code === 'auth' && f2.calls.chat.length === 2, `${e2?.code} after ${f2.calls.chat.length}`);
+  }
+  {
+    // A timed-out request may still be billed: its worst case counts against the cost cap.
+    const f = fakeOpenRouter([hang, hang, hang]);
+    const budget = createBudget();
+    await errOf(chat({ ...base, fetchImpl: f, timeoutMs: 30, budget }));
+    check('openrouter: timed-out attempts count their worst-case cost toward the cap', budget.used.costUsd > 0 && budget.used.calls === 3, JSON.stringify(budget.used));
+  }
+  {
+    // Per-call cap: input (+30% margin) and output must fit the pinned endpoint's context.
+    const saved = ENDPOINTS['deepseek/deepseek-v3.2'][0].context_length;
+    ENDPOINTS['deepseek/deepseek-v3.2'][0].context_length = 4000;
+    const f = fakeOpenRouter([{ content: '{}', provider: 'DeepInfra' }]);
+    const e = await errOf(chat({ ...base, fetchImpl: f, user: 'x'.repeat(12_000) }));
+    check('openrouter: a call over the context length is refused before sending, no fallback', e?.code === 'context-cap' && f.calls.chat.length === 0, e?.message);
+    ENDPOINTS['deepseek/deepseek-v3.2'][0].context_length = saved;
   }
   {
     const f = fakeOpenRouter([{ content: '{"ok":true}', provider: 'Venice' }, { content: '{"ok":true}', provider: 'Google AI Studio' }]);
@@ -263,7 +303,7 @@ const hang = (init) => new Promise((_, reject) => {
   {
     // Gemini reasons even at the lowest level: reasoning tokens count toward cost and the output cap.
     const usage = { prompt_tokens: 1000, completion_tokens: 700, prompt_tokens_details: { cached_tokens: 200 }, completion_tokens_details: { reasoning_tokens: 500 } };
-    const f = fakeOpenRouter([json(503, {}), { content: '{"ok":1}', provider: 'Google', usage }]); // no cost reported
+    const f = fakeOpenRouter([json(503, {}), json(503, {}), { content: '{"ok":1}', provider: 'Google', usage }]); // no cost reported
     const budget = createBudget({ maxOutputTokens: 10000 });
     const r = await chat({ ...base, fetchImpl: f, budget });
     const want = 800 * 0.00000075 + 200 * 0.000000075 + 200 * 0.00000375 + 500 * 0.00000375;
@@ -341,6 +381,162 @@ const hang = (init) => new Promise((_, reject) => {
     const out = await analyzeAll(jobs, { routes: {}, budget: null, maskCounts: newCounts(), concurrency: 1, chatImpl: stub });
     check('phase2: bad shape fails one job; a cost cap stops the rest without calling',
       out[0].error === 'bad-shape' && out[1].error === 'cost-cap' && out[2].error === 'not sent: cost-cap' && n === 2, JSON.stringify(out.map((o) => o.error)));
+  }
+
+  // ---------- Caps: an oversized invented window (phase 3) ----------
+  {
+    const { planJobs, analyzeAll: runAll } = require('../src/digest/analyze');
+    const { renderDigest: render } = require('../src/digest/render');
+    const conv = (id) => ({ id, external: false });
+    const msgs = (id, n, chars) => Array.from({ length: n }, (_, k) => ({ conv: conv(id), ts: `${1000 + k}.0`, who: 'Invented Person', text: 'z'.repeat(chars) }));
+    // 40 customers of growing size (about 2k to 40k tokens each, about 840k in all), 6 unit sub-groups, and one
+    // customer far over the per-call cap.
+    const jobs = [];
+    for (let i = 1; i <= 40; i++) jobs.push({ kind: 'customer', key: `C${i}`, header: `Customer channel: #c${i}.`, messages: msgs(`C${i}`, 4 * i, 400) });
+    for (let i = 1; i <= 6; i++) jobs.push({ kind: 'unit', key: `U${i}`, header: `Unit ${i}.`, messages: msgs(`G${i}`, 20 * i, 400) });
+    jobs.push({ kind: 'customer', key: 'CBIG', header: 'Customer channel: #big.', messages: msgs('CBIG', 1200, 1000) });
+    const plan = planJobs(jobs, { runCap: 400_000, callCap: 100_000 });
+    const kept = jobs.filter((j) => !j.capSkipped);
+    const big = jobs.find((j) => j.key === 'CBIG');
+    check('caps: the planned input stays under the 400k run cap', plan.estimatedInputTokens <= 400_000 && kept.reduce((t, j) => t + j.est, 0) === plan.estimatedInputTokens, String(plan.estimatedInputTokens));
+    check('caps: a call over the per-call cap keeps its newest messages and fits', big.est <= 100_000 && big.trimmed > 0 && big.messages.at(-1).ts === '2199.0', `${big.est} tokens, trimmed ${big.trimmed}`);
+    const keptCustomers = kept.filter((j) => j.kind === 'customer').map((j) => j.messages.length + j.trimmed);
+    const skippedCustomers = jobs.filter((j) => j.capSkipped && j.kind === 'customer').map((j) => j.messages.length + j.trimmed);
+    check('caps: busiest customers are summarized first; the rest are skipped, not aborted',
+      plan.skippedCalls > 0 && Math.min(...keptCustomers) >= Math.max(...skippedCustomers, 0) && plan.skippedMessages === jobs.filter((j) => j.capSkipped).reduce((t, j) => t + j.messages.length + j.trimmed, 0),
+      JSON.stringify({ skipped: plan.skippedCalls, kept: keptCustomers.length }));
+    check('caps: customers come before unit sub-groups', jobs.filter((j) => j.kind === 'unit').every((j) => j.capSkipped) || jobs.filter((j) => j.kind === 'customer').every((j) => !j.capSkipped));
+    let sent = 0;
+    const stub = async () => { sent++; return { route: 'primary', model: 'm', provider: 'P', json: { went_wrong: [], risks: [], points: [] }, usage: {}, costUsd: 0 }; };
+    const out = await runAll(jobs, { routes: {}, budget: null, maskCounts: newCounts(), concurrency: 3, chatImpl: stub });
+    check('caps: skipped calls are never sent', sent === kept.length && out.filter((r) => r.capSkipped).length === plan.skippedCalls, `${sent} sent, ${kept.length} planned`);
+    // The digest names what was not summarized, with counts.
+    const blocks = jobs.filter((j) => j.kind === 'customer').map((j) => ({ conv: { id: j.key, name: j.key.toLowerCase(), type: 'public' }, compressed: { stats: { messagesIn: j.messages.length + j.trimmed } } }));
+    const analysis = new Map(jobs.filter((j) => j.kind === 'customer').map((j) => [j.key, out[jobs.indexOf(j)]]));
+    const md = render({ units: [{ bu: 'Unit B', subs: [{ sub: 'Customers', blocks, quiet: [], errors: [], analysis }] }], window: { start: 0, end: 86400, hours: 24, reason: 'test' }, footer: [],
+      ctx: { workspaceUrl: 'https://ws.example.test', analyzed: true, writtenBy: 'm via P', nameOf: () => '' }, customerKey: { bu: 'Unit B', sub: 'Customers' } });
+    check('caps: the digest lists "Not summarized (cap)" with counts', new RegExp(`Not summarized \\(cap\\): ${skippedCustomers.length} customers, ${skippedCustomers.reduce((a, b) => a + b, 0)} messages`).test(md));
+  }
+
+  // ---------- Slack DM delivery (phase 3): send-only client and message (invented IDs and text) ----------
+  {
+    const { createSender, METHODS } = require('../src/slack-send');
+    const { buildDm, MAX_CHARS } = require('../src/digest/dm');
+    const ME = 'U0INVENTED1';
+    const BOT_TOKEN = 'invented-bot-token';
+    function fakeSlack({ openReply } = {}) {
+      const calls = [];
+      const f = async (url, init = {}) => {
+        const u = new URL(url);
+        calls.push({ host: u.hostname, method: u.pathname.replace('/api/', ''), init });
+        const ok = (b) => json(200, { ok: true, ...b });
+        if (u.hostname === 'files.example-upload.slack.com') return json(200, {});
+        switch (u.pathname) {
+          case '/api/conversations.open': return ok(openReply ?? { channel: { id: 'D0INVENTED', is_im: true, user: ME } });
+          case '/api/chat.postMessage': return ok({ channel: 'D0INVENTED', ts: '1.0' });
+          case '/api/files.getUploadURLExternal': return ok({ upload_url: 'https://files.example-upload.slack.com/upload/v1/abc', file_id: 'F0INVENTED' });
+          case '/api/files.completeUploadExternal': return ok({ files: [{ id: 'F0INVENTED' }] });
+          default: return json(200, { ok: false, error: 'unknown_method' });
+        }
+      };
+      f.calls = calls;
+      return f;
+    }
+    {
+      const f = fakeSlack();
+      const s = createSender({ recipient: ME, fetchImpl: f, tokenReader: () => BOT_TOKEN });
+      let early;
+      try { await s.postText('x'); } catch (e) { early = e.code; }
+      await s.openDm();
+      await s.postText('Invented one-line test.');
+      await s.uploadFile('2026-01-01.md', Buffer.from('invented digest'), 'Slack digest');
+      const api = f.calls.filter((c) => c.host === 'slack.com');
+      const upload = f.calls.find((c) => c.host !== 'slack.com');
+      check('deliver: nothing is posted before the DM is verified', early === 'dm-not-verified');
+      check('deliver: open DM, post, get upload URL, upload, complete; into the verified DM only',
+        api.map((c) => c.method).join(',') === 'conversations.open,chat.postMessage,files.getUploadURLExternal,files.completeUploadExternal'
+        && JSON.parse(api[1].init.body).channel === 'D0INVENTED' && JSON.parse(api[3].init.body).channel_id === 'D0INVENTED', api.map((c) => c.method).join(','));
+      check('deliver: bot token only in the Authorization header, never sent to the upload host',
+        api.every((c) => c.init.headers.Authorization === `Bearer ${BOT_TOKEN}` && !String(c.init.body).includes(BOT_TOKEN)) && !JSON.stringify(upload.init.headers).includes(BOT_TOKEN));
+      check('deliver: links are not unfurled', JSON.parse(api[1].init.body).unfurl_links === false);
+      check('deliver: only four write-side methods are known', [...METHODS].sort().join(',') === 'chat.postMessage,conversations.open,files.completeUploadExternal,files.getUploadURLExternal');
+    }
+    for (const [label, openReply] of [
+      ['a DM with someone else', { channel: { id: 'D0OTHER', is_im: true, user: 'U0SOMEONE' } }],
+      ['a channel, not a DM', { channel: { id: 'C0CHANNEL', is_im: false, user: ME } }],
+      ['no user field', { channel: { id: 'D0INVENTED' } }],
+    ]) {
+      const f = fakeSlack({ openReply });
+      const s = createSender({ recipient: ME, fetchImpl: f, tokenReader: () => BOT_TOKEN });
+      let code;
+      try { await s.openDm(); await s.postText('x'); } catch (e) { code = e.code; }
+      check(`deliver: refused when conversations.open returns ${label}; nothing posted`, code === 'dm-mismatch' && !f.calls.some((c) => c.method === 'chat.postMessage'), code);
+    }
+    {
+      let code;
+      try { createSender({ recipient: 'C0CHANNEL', fetchImpl: fakeSlack(), tokenReader: () => BOT_TOKEN }); } catch (e) { code = e.code; }
+      check('deliver: a recipient that is not a user ID is refused', code === 'bad-recipient');
+      const f = async (url) => (new URL(url).pathname === '/api/files.getUploadURLExternal'
+        ? json(200, { ok: true, upload_url: 'https://evil.example.test/up', file_id: 'F1' }) : fakeSlack()(url));
+      const s = createSender({ recipient: ME, fetchImpl: f, tokenReader: () => BOT_TOKEN });
+      await s.openDm();
+      let up;
+      try { await s.uploadFile('a.md', Buffer.from('x'), 't'); } catch (e) { up = e.code; }
+      check('deliver: an upload URL off slack.com is refused', up === 'bad-upload-url');
+      let tok;
+      try { createSender({ recipient: ME, tokenReader: () => { throw new Error('mode'); } }); } catch (e) { tok = e.code; }
+      check('deliver: an unreadable or loose bot-token file stops delivery', tok === 'bot-token');
+    }
+    {
+      // The DM: date and model header, customer items first (escaped, code-built links), a line per other unit,
+      // not-summarized counts, and under the length limit even with many items.
+      const refMap = new Map([['m001', { conv: 'C1', ts: '100.000001', threadTs: null }]]);
+      const item = (n, lvl) => ({ summary: `Invented problem ${n} <script> & more ${'x'.repeat(120)}`, severity: lvl, refs: ['m001'] });
+      const analysis = new Map();
+      const blocks = [];
+      for (let i = 0; i < 12; i++) {
+        blocks.push({ conv: { id: `C${i}`, name: `success-${i}`, type: 'public' }, compressed: { stats: { messagesIn: 5 } } });
+        analysis.set(`C${i}`, { ok: true, notable: true, refMap, wentWrong: [item(i, i % 3 ? 'low' : 'high'), item(i + 100, 'medium')], risks: [{ ...item(i + 200, 'x'), likelihood: 'medium' }] });
+      }
+      blocks.push({ conv: { id: 'CQ', name: 'success-capped', type: 'public' }, compressed: { stats: { messagesIn: 9 } } });
+      analysis.set('CQ', { ok: false, capSkipped: true, error: 'not summarized (cap)' });
+      const units = [
+        { bu: 'Unit B', subs: [{ sub: 'Customers', blocks, quiet: [], errors: [], analysis }] },
+        { bu: 'Unit A', subs: [{ sub: 'Ops', blocks: [{ conv: { id: 'C9', name: 'ops' }, compressed: { stats: { messagesIn: 3 } } }], quiet: [], errors: [],
+          analysis: { ok: true, refMap, points: [{ summary: 'Invented ops point', refs: ['m001'] }] } }] },
+      ];
+      const { text, stats } = buildDm({ units, ctx: { workspaceUrl: 'https://ws.example.test', writtenBy: 'm via P', me: null }, customerKey: { bu: 'Unit B', sub: 'Customers' },
+        window: { start: 0, end: 86400, hours: 24 }, counts: { noCloud: { conversations: 2, messages: 7 }, unreadable: 1 } });
+      const links = text.match(/<[^>]+>/g) ?? [];
+      check('dm: under the length limit, with the rest pointed to the file', text.length <= MAX_CHARS && stats.customerItemsShown < stats.customerItems && /…and \d+ more in the file/.test(text), `${text.length} chars`);
+      check('dm: header, customer risks first, other units, then not-summarized counts', /^\*Slack digest, .*\n+Model: m via P/.test(text)
+        && text.indexOf('*Unit B risks*') < text.indexOf('*Other units*') && text.indexOf('*Other units*') < text.indexOf('*Not summarized*')
+        && /Unit A: 1 active conversation: Invented ops point/.test(text) && /2 conversations on the noCloud list \(7 messages\); 1 call over the cap \(9 messages\); 1 conversation unreadable/.test(text));
+      check('dm: most severe items first', text.split('\n').find((l) => l.startsWith('• ')).includes('[high problem]'));
+      check('dm: model text is escaped; the only links are code-built Slack links', !text.includes('<script>') && text.includes('&lt;script&gt; &amp;')
+        && links.length > 0 && links.every((l) => l.startsWith('<https://ws.example.test/archives/C1/p100000001|')));
+    }
+  }
+
+  // ---------- Healthcheck ping helper (phase 3) ----------
+  {
+    const { checkPingFile, ping } = require('../src/healthcheck');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hc-'));
+    fs.writeFileSync(path.join(dir, 'healthcheck-url-t'), 'https://hc.example.test/ping/invented\n', { mode: 0o600 });
+    fs.writeFileSync(path.join(dir, 'healthcheck-url-loose'), 'https://hc.example.test/x\n', { mode: 0o644 });
+    fs.chmodSync(path.join(dir, 'healthcheck-url-loose'), 0o644);
+    let e1;
+    try { checkPingFile('loose', dir); } catch (e) { e1 = e.message; }
+    let e2;
+    try { checkPingFile('missing', dir); } catch (e) { e2 = e.message; }
+    check('healthcheck: loose or missing URL file refused', /mode 600/.test(e1 ?? '') && /not found/.test(e2 ?? ''));
+    const sent = [];
+    const f = async (url, init) => { sent.push({ url, body: init.body }); return { ok: true, status: 200 }; };
+    await ping('t', false, 'ok', { fetchImpl: f, dir });
+    await ping('t', true, 'x'.repeat(20_000), { fetchImpl: f, dir });
+    check('healthcheck: success to the URL, failure to /fail, body cut to 10 kB',
+      sent[0].url === 'https://hc.example.test/ping/invented' && sent[1].url === 'https://hc.example.test/ping/invented/fail' && sent[1].body.length === 10_000);
+    fs.rmSync(dir, { recursive: true });
   }
 
   // ---------- Bot compression (added with phase 1) ----------

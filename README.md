@@ -9,6 +9,10 @@ A small service on the home-lab Mac mini that runs **named shell jobs on request
  you / curl ───────────────────────────────┘   src/server.js    └──> data/dispatcher.db (run log)
                                                     │
                           healthchecks.io <─────────┘ (scheduled runs only, pinged by schedule-run.js)
+
+ launchd (06:00) ──> src/digest/run.js --scheduled ──> Slack (read) ──> OpenRouter ──> data/digests/<date>.md
+                     (Slack digest; the one schedule        │                              │
+                      outside the dispatcher)               └── healthchecks.io      Slack DM to you (bot token)
 ```
 
 ## Repository map
@@ -20,17 +24,20 @@ A small service on the home-lab Mac mini that runs **named shell jobs on request
 | `src/llm.js` | Shared LLM helper for jobs | Lets a job classify, extract or summarize text with the local Ollama model; see `docs/adding-jobs.md` |
 | `src/llm-prompts.js` | Prompt templates for `src/llm.js` | One tested template per task type, kept apart from the plumbing |
 | `jobs/` | The runnable jobs (`<name>.sh`) | The only things the service can execute. See `jobs/README.md` |
-| `launchd/` | LaunchAgent plist templates | Keep the service and schedules running; one file per agent |
+| `launchd/` | LaunchAgent plist templates | Keep the service and schedules running; one file per agent (`com.lab.schedule.slack-digest.plist` runs the digest directly at 06:00) |
 | `scripts/` | Operator helpers | `install-agent.sh` installs a plist from `launchd/`; `llm-eval.js` checks the LLM prompt templates |
 | `src/slack.js` | Shared read-only Slack client and unit rules | Used by the measurement scripts and the digest; also decides which conversations are external (masked) |
 | `src/secrets.js` | Reads `~/.lab/<name>` with the mode-600 check | One secret check for every client |
-| `src/openrouter.js` | OpenRouter client (cloud models for the Slack digest) | Primary and secondary model routes, each pinned to one provider; fallback in code; served-provider check; live prices; input, output and cost caps; see `docs/slack-digest.md` |
+| `src/openrouter.js` | OpenRouter client (cloud models for the Slack digest) | Primary and secondary model routes, each pinned to one provider; one primary retry, then the fallback, in code; served-provider check; live prices; run and per-call input caps, output and cost caps; see `docs/slack-digest.md` |
+| `src/slack-send.js` | Send-only Slack client (bot token) for the digest DM | Opens the DM with the one configured user, checks it is theirs, posts and uploads there; every other method or target is refused |
+| `src/healthcheck.js` | healthchecks.io ping for the digest's own schedule | Checks the URL file's mode and pings success or `/fail` with stats only |
 | `src/mask.js` | Masks secrets (every conversation) and emails, phones, long numbers and URLs with tokens (external conversations) | Applied before any text goes to a model |
-| `src/digest/` | The daily Slack digest: `run.js` (entry point), `fetch.js`, `compress.js` (bot posts, in code), `analyze.js` (model calls and validation), `prompts.js` (prompt templates), `render.js` | Writes the digest to `data/digests/` (mode 600); see `docs/slack-digest.md` |
+| `src/digest/` | The daily Slack digest: `run.js` (entry point), `fetch.js`, `compress.js` (bot posts, in code), `analyze.js` (cap planning, model calls and validation), `prompts.js` (prompt templates), `render.js` (the digest file), `dm.js` (the short morning DM) | Writes the digest to `data/digests/` (mode 600, newest 14 kept) and, on scheduled runs, sends it to you by Slack DM; see `docs/slack-digest.md` |
 | `scripts/slack-channels.js`, `scripts/slack-measure.js` | Slack measurement (terminal only) | Count how many tokens a daily Slack digest would read, to choose between the local and a cloud model. See `docs/slack-measurement.md` |
 | `scripts/model-check.js` | Live check of each model route: model, served provider, tokens, cost, JSON shape | Uses invented text only; `--dry-run` shows request bodies and live prices without calling |
 | `scripts/digest-eval.js` | Eval of the digest prompts on invented sample days, both model routes side by side | Run after changing `src/digest/prompts.js`; the primary must pass |
-| `scripts/digest-selftest.js` | Self-tests for masking, the OpenRouter client (fallback, caps, guards) and bot compression | Invented data, no network; run after changing any of them |
+| `scripts/digest-selftest.js` | Self-tests for masking, the OpenRouter client (retry, fallback, caps, guards), cap planning, the DM and send-only client, the healthcheck helper and bot compression | Invented data, no network; run after changing any of them |
+| `scripts/digest-dm-test.js` | Sends one invented line to your digest DM | Checks the bot token, scopes and DM check; prints stats only |
 | `config/` | Settings that are not secrets | `slack-bus.example.json` is the template; the real `slack-bus.json` (Slack channel to business unit rules) is git-ignored |
 | `data/` | Runtime data (everything except `.gitkeep` is git-ignored) | Holds `dispatcher.db`, `slack-channels.json`, `slack-measure-<date>.json`, `digests/` (mode 600) and `digest-state.json` |
 | `docs/` | Detailed documentation | Architecture, operations, adding jobs, design decisions, Slack digest design |
@@ -55,4 +62,4 @@ curl -s -X POST -H "Authorization: Bearer $(cat ~/.lab/token)" localhost:8787/ru
 - **Why things are the way they are:** [docs/decisions.md](docs/decisions.md)
 
 ## Secrets
-All secrets live in `~/.lab/` (directory 700, files 600) and never in this repo: `token`, `healthcheck-url-<job>`, `slack-token` and `openrouter-key`.
+All secrets live in `~/.lab/` (directory 700, files 600) and never in this repo: `token`, `healthcheck-url-<job>` (including `healthcheck-url-slack-digest`), `slack-token` (Slack reading), `slack-bot-token` (Slack sending, same app) and `openrouter-key`.

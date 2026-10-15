@@ -4,10 +4,11 @@
 // may log only the model, provider, token counts, cost and error codes it returns.
 //
 // Two routes, each pinned to its own provider(s) with no OpenRouter fallbacks:
-//   primary   (config models.primary)   tried first
-//   secondary (config models.secondary) tried ONCE, only if the primary times out, returns 5xx or 429, or is served
-//                                       by a provider that is not pinned. Never a third attempt; never two models
-//                                       in one request.
+//   primary   (config models.primary)   tried first; after a timeout, 5xx or 429 it is retried ONCE after a short
+//                                       backoff (RETRY_DELAY_MS, or Retry-After up to RETRY_MAX_MS)
+//   secondary (config models.secondary) tried ONCE, only if the primary (after its retry, where one applies) timed
+//                                       out, returned 5xx or 429, or was served by a provider that is not pinned.
+// At most three requests per call (primary, primary retry, secondary); never two models in one request.
 // Every request: no tools; provider { order, only, allow_fallbacks: false, require_parameters: true,
 // data_collection: "deny" }; reasoning off (or the lowest level, for models that cannot turn it off) unless the
 // reasoning flag is set. After each reply the served provider is checked with OpenRouter's generation stats.
@@ -20,6 +21,9 @@ const { readSecret } = require('./secrets');
 const BASE_URL = 'https://openrouter.ai/api/v1'; // hardcoded on purpose, like the Ollama URL in llm.js
 const CHAT_URL = `${BASE_URL}/chat/completions`;
 const FALLBACK_CODES = new Set(['timeout', 'server-error', 'rate-limited', 'provider-mismatch']);
+const RETRY_CODES = new Set(['timeout', 'server-error', 'rate-limited']); // transient: worth one more try on the primary
+const RETRY_DELAY_MS = 3000;
+const RETRY_MAX_MS = 10_000;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const estimateTokens = (s) => Math.ceil(String(s ?? '').length / 4);
@@ -103,6 +107,7 @@ async function livePricing(route, { fetchImpl = fetch, timeoutMs = 30_000 } = {}
     ...priced(rows),
     worst: priced(under),
     maxOutputTokens: Math.min(...rows.map((e) => e.max_completion_tokens ?? Infinity)),
+    contextLength: Math.min(...rows.map((e) => e.context_length || Infinity)) === Infinity ? null : Math.min(...rows.map((e) => e.context_length || Infinity)),
     providerNames: [...new Set(under.map((e) => e.provider_name))],
     tags: rows.map((e) => e.tag),
     tagsUnderSlug: under.map((e) => e.tag),
@@ -118,7 +123,7 @@ function costFromPrices(prices, usage) {
 }
 
 // Per-run limits that apply to whichever model serves: input tokens, output tokens (reasoning included) and cost.
-function createBudget({ maxInputTokens = 122_000, maxOutputTokens = 60_000, maxCostUsd = 0.5 } = {}) {
+function createBudget({ maxInputTokens = 400_000, maxOutputTokens = 60_000, maxCostUsd = 0.5 } = {}) {
   const used = { inputTokens: 0, outputTokens: 0, reasoningTokens: 0, costUsd: 0, calls: 0 };
   return {
     used,
@@ -176,6 +181,11 @@ async function attempt(route, opts, ctx) {
     throw new ModelError('bad-request', `max_tokens ${body.max_tokens} is over the pinned endpoint's ${prices.maxOutputTokens}`);
   }
   const estInput = estimateTokens(opts.system) + estimateTokens(opts.user);
+  // Per-call input cap: the estimate (characters / 4) can run low, so it gets a 30% margin against the pinned
+  // endpoint's context length, together with the output allowance.
+  if (prices.contextLength && Math.ceil(estInput * 1.3) + body.max_tokens > prices.contextLength) {
+    throw new ModelError('context-cap', `about ${estInput} input tokens (+30% margin) and ${body.max_tokens} output do not fit ${route.model}'s ${prices.contextLength}-token context`);
+  }
   const w = prices.worst ?? prices;
   const worst = estInput * w.in + body.max_tokens * Math.max(w.out, w.reasoning);
   if (opts.budget) opts.budget.check(estInput, body.max_tokens, worst);
@@ -189,10 +199,17 @@ async function attempt(route, opts, ctx) {
       signal: AbortSignal.timeout(opts.timeoutMs),
     });
   } catch (e) {
-    if (e.name === 'TimeoutError' || e.name === 'AbortError') throw new ModelError('timeout', `no reply within ${opts.timeoutMs / 1000}s`);
+    if (e.name === 'TimeoutError' || e.name === 'AbortError') {
+      // The provider may still bill a request we gave up on, so the cost cap counts its worst case.
+      if (opts.budget) opts.budget.add({ prompt: estInput, completion: 0, reasoning: 0 }, worst);
+      throw new ModelError('timeout', `no reply within ${opts.timeoutMs / 1000}s`);
+    }
     throw new ModelError('network', `network error (${e.cause?.code ?? e.name})`);
   }
-  if (res.status === 429) throw new ModelError('rate-limited', 'HTTP 429');
+  if (res.status === 429) {
+    const after = Number(res.headers?.get?.('retry-after'));
+    throw new ModelError('rate-limited', 'HTTP 429', Number.isFinite(after) && after > 0 ? { retryAfterMs: after * 1000 } : {});
+  }
   if (res.status >= 500) throw new ModelError('server-error', `HTTP ${res.status}`);
   if (res.status === 401 || res.status === 403) throw new ModelError('auth', `HTTP ${res.status}: check ~/.lab/openrouter-key`);
   if (res.status === 402) throw new ModelError('balance', 'HTTP 402: out of credits or over the key limit');
@@ -249,17 +266,36 @@ async function chat(opts) {
   };
   const { primary, secondary } = o.routes;
   if (o.only) return attempt(o.only === 'secondary' ? secondary : primary, o, ctx);
+  // primaryErrors: the error code of every failed primary attempt, in order (codes only, for stats and the footer).
+  const primaryErrors = [];
+  let lastError;
+  for (let tryNo = 1; tryNo <= 2; tryNo++) {
+    try {
+      const r = await attempt(primary, o, ctx);
+      return { ...r, fellBack: false, retried: tryNo > 1, primaryErrors };
+    } catch (e) {
+      primaryErrors.push(e.code);
+      lastError = e;
+      if (!RETRY_CODES.has(e.code) || tryNo === 2) break;
+      await ctx.sleepImpl(Math.min(e.retryAfterMs ?? RETRY_DELAY_MS, RETRY_MAX_MS));
+    }
+  }
+  if (!FALLBACK_CODES.has(lastError.code) || !secondary) {
+    lastError.primaryErrors = primaryErrors;
+    throw lastError;
+  }
+  // One attempt on the secondary, never more.
   try {
-    return { ...(await attempt(primary, o, ctx)), fellBack: false };
-  } catch (e) {
-    if (!FALLBACK_CODES.has(e.code) || !secondary) throw e;
-    // One attempt on the secondary, never more.
     const r = await attempt(secondary, o, ctx);
-    return { ...r, fellBack: true, primaryError: e.code };
+    return { ...r, fellBack: true, retried: primaryErrors.length > 1, primaryError: lastError.code, primaryErrors };
+  } catch (e) {
+    e.primaryErrors = primaryErrors;
+    e.fellBack = true;
+    throw e;
   }
 }
 
 module.exports = {
   chat, buildBody, livePricing, costFromPrices, createBudget, loadRoutes, estimateTokens,
-  ModelError, FALLBACK_CODES, CHAT_URL, BASE_URL,
+  ModelError, FALLBACK_CODES, RETRY_CODES, RETRY_DELAY_MS, CHAT_URL, BASE_URL,
 };

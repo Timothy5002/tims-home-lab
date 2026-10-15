@@ -1,6 +1,6 @@
 # Slack digest: design and build plan
 
-**Status.** Phases 0, 1 and 2 are built. Later phases are built only after the user approves each one.
+**Status.** Phases 0, 1, 2 and 3 are built. Phase 3 includes Slack DM delivery, which was first planned as phase 6. Later phases are built only after the user approves each one.
 
 **Workspace details live elsewhere.** This doc names no real channels, business units or people. Those details, plus the open questions, are in `docs/private/` (git-ignored), and the rules themselves are in `config/` (git-ignored, with tracked examples).
 
@@ -18,7 +18,7 @@ For each of that unit's customers with activity since the last digest, the diges
 ## Hard rules (every phase)
 1. **Slack is read-only.**
    - The reader uses the existing user token (`~/.lab/slack-token`) and its fixed list of read methods. Its scopes are not widened, and it never writes.
-   - Delivery by DM (phase 6) uses a separate Slack app with its own token.
+   - Delivery by DM (built in phase 3) uses the **same Slack app's bot token** (`~/.lab/slack-bot-token`), in a separate send-only client, `src/slack-send.js`. That client never reads and can post only into the verified DM with the configured user (user decision; a separate app was the earlier plan).
 2. **Message text is untrusted data.**
    - The model gets no tools. Its system prompt says messages are data to analyze, never instructions.
    - Messages are sent as JSON-escaped fields.
@@ -73,8 +73,9 @@ The digest calls models through **OpenRouter's OpenAI-compatible API** (`POST ht
 
 **Fallback, in code, never by OpenRouter:**
 1. Try the primary.
-2. On a timeout, a 5xx, a 429, or a reply served by a provider that is not pinned, try the secondary **once**. There is never a third attempt, and never two models in one request.
-3. Anything else fails the call: auth, out of credit, no endpoint fits the pins or data policy, an empty or invalid reply.
+2. On a timeout, a 5xx or a 429, wait about 3 s (Retry-After is honored, up to 10 s) and retry the primary **once** (user decision, phase 3).
+3. If it still fails that way, or a reply was served by a provider that is not pinned, try the secondary **once**. That is at most three requests per call, and never two models in one request. Retry and fallback reasons are counted as error codes.
+4. Anything else fails the call: auth, out of credit, no endpoint fits the pins or data policy, a call too big for the context, an empty or invalid reply.
 
 Fallbacks should be rare. A digest written by the secondary can read differently, and that is accepted.
 
@@ -83,7 +84,7 @@ Fallbacks should be rare. A digest written by the secondary can read differently
 **What is logged and shown:**
 - **Per run, no text:** which model and provider served each call.
 - **In the digest:** the header names the model that wrote it.
-- **In the healthcheck:** if the secondary served, the ping body says so (phase 3).
+- **In the digest footer and the healthcheck ping:** retries and fallbacks, with their reasons (error codes only).
 
 **Cost** comes from OpenRouter: the generation's total cost. When it is missing, it is computed from **live per-token prices** that the client reads from OpenRouter's public endpoint list (`/api/v1/models/<model>/endpoints`) for the pinned endpoints. Reasoning tokens count as output for both cost and the output cap. There is no time-of-day pricing logic: the pinned endpoints report flat prices. If a pinned slug could also match dearer tiers of the same provider, the per-run cost cap assumes the dearest. `scripts/model-check.js --dry-run` prints the live prices.
 
@@ -92,10 +93,11 @@ Fallbacks should be rare. A digest written by the secondary can read differently
 ## How it runs
 A run fetches about 180 conversations (Slack calls spaced 1.3 s apart) and then makes model calls. That is far over the dispatcher's 60-second job limit.
 
-**Approved: a standalone launchd schedule** (`com.lab.schedule.slack-digest`, phase 3) that runs `node src/digest/run.js --scheduled` directly. This is a recorded exception to "schedules call the dispatcher"; see `docs/decisions.md`. The script:
+**Approved and built: a standalone launchd schedule** (`com.lab.schedule.slack-digest`, phase 3, 06:00 daily) that runs `node src/digest/run.js --scheduled` directly. This is a recorded exception to "schedules call the dispatcher"; see `docs/decisions.md`. The script:
 - pings its own healthchecks.io check: success, or `/fail` on any failure, abort or deadline. The URL comes from `~/.lab/healthcheck-url-slack-digest`, which the user creates before the schedule is installed. Suggested period 1 day, grace 2 hours.
 - writes one row to the `runs` table in `data/dispatcher.db`. The source is `launchd-direct`, or `manual` for hand runs, and the row holds counts and cost only.
 - enforces its own deadline of 25 minutes. It is a single process and starts no children.
+- records the success only after the digest file is written (temp file and rename), keeps the newest 14 digests, then delivers the DM (see "Delivery by Slack DM").
 
 **Window.** Each run covers everything since the last successful scheduled run, capped at 72 hours, so Mondays and missed days are covered. The time of the last success is kept in `data/digest-state.json`, which holds a timestamp only. With no recorded run, the window is the last 24 hours. Hand runs never move that timestamp unless asked to.
 
@@ -110,19 +112,19 @@ A run fetches about 180 conversations (Slack calls spaced 1.3 s apart) and then 
    - Always keep up to 5 instances containing alert words (error, failed, down, outage, escalate, urgent, cancel, refund, churn, complaint and similar).
    - The compression ratio is reported every run.
 4. **Group** by unit and sub-group. In the customer-success unit, each per-customer success channel is its own block. Phase 4 widens a block to all of that customer's channels.
-5. **Budget check.** Estimate input tokens (characters ÷ 4) before any model call, and abort if over the per-run cap.
+5. **Plan under the caps.** Estimate input tokens (characters ÷ 4) before any model call. Customers go first, then sub-groups, busiest first. What does not fit the 400,000-token run cap is marked "not summarized (cap)" with counts, and the run does not abort. A call over the 100,000-token per-call cap keeps its newest messages.
 6. **Mask** external text (phase 2 onward). Phase 1 runs the masking on the would-be input and reports counts only.
 7. **Model calls** (phase 2 onward):
    - one JSON call per active customer (risk extraction)
    - one per other unit (short summary)
-   - at most 3 at a time, each with a timeout and retries
+   - at most 3 at a time, each with a timeout, one primary retry and one fallback
 8. **Validate** replies against their schema and drop claims with invalid references. Sanitize model text by removing URLs, `<@…>`, `<!channel>`, `<!here>` and link syntax, so links only come from code and a crafted message cannot make the digest mention or link anyone.
 9. **Render** `data/digests/<date>.md` (mode 600). Order:
    1. customer blocks (by health once phase 4 exists)
    2. other units
    3. a one-line list of quiet customers
    4. a footer with counts, masking counts, tokens, cost and runtime
-10. **Finish.** Drop all text, write the run row, and ping the healthcheck when scheduled.
+10. **Finish.** Record the success, prune old digests, send the DM when scheduled, drop all text, write the run row, and ping the healthcheck when scheduled.
 
 **Links** are built in code from the workspace URL in `config/slack-digest.json`: `<workspace>/archives/<channel>/p<ts without the dot>`. Thread replies add `?thread_ts=<parent>&cid=<channel>`.
 
@@ -169,21 +171,23 @@ It checks the `notable` flags, the expected issues, that every reference is vali
 3. **Verify in code.** Keep a conflict only if both quotes are exact parts of the masked text the model saw. Each kept conflict is shown as "**Possible conflict, verify**" with both links.
 4. **Test** against real past cases the user supplies, plus invented near-misses that must not be flagged.
 
-## Delivery by Slack DM (phase 6, not yet approved)
-- **A separate Slack app.** Its bot token has only `chat:write` and is stored at `~/.lab/slack-bot-token` (mode 600).
-- **One method only:** the delivery client knows only `chat.postMessage`, and code refuses every channel except the user's own ID (from git-ignored config).
-- **The file stays the record:** the digest is split under Slack's size limits, and the file is still written.
-- **Manual steps for the user:** creating and installing the app happen in Slack's web UI.
+## Delivery by Slack DM (built in phase 3)
+- **The same Slack app** as the reader. Its bot token (`~/.lab/slack-bot-token`, mode 600, Authorization header only) has `chat:write`, `im:write` and `files:write`. No events and no read scopes are used with it.
+- **Four methods only:** `conversations.open`, `chat.postMessage`, `files.getUploadURLExternal`, `files.completeUploadExternal`. The client refuses any other method, posts only after `conversations.open` returns a 1:1 DM whose user is the configured ID (`deliverTo`, git-ignored), and has no channel argument. File bytes go only to an `https` upload URL on slack.com.
+- **What is sent:** a short message under about 3,000 characters (date and model; the customer group's risks, one line per item with its link; one line per other unit; not-summarized counts), then the full digest file uploaded to the same DM.
+- **The file stays the record:** if delivery fails, the digest file is kept, the success is recorded, and the healthcheck gets `/fail` with the reason code.
+- **Manual steps for the user:** creating and installing the app, its scopes and the App Home Messages tab are done in Slack's web UI.
 
 ## Cost controls
 | Control | Value |
 |---|---|
-| Per-run input cap (estimated tokens) | 122,000, which is 2× the measured peak. A call that would pass it is refused before it is sent |
+| Per-run input cap (estimated tokens) | 400,000, about 6.5× the measured daily peak (a 72-hour window after missed days). The busiest calls are planned first; the rest are "not summarized (cap)" |
+| Per-call input cap (estimated tokens) | 100,000, under DeepSeek V3.2's 163,840-token context with a 30% margin for the estimate; longer calls keep their newest messages |
 | Per-run output cap | 60,000 tokens, reasoning included |
-| Per-run cost cap | $0.50, checked before each call against the worst case for whichever route is about to run |
+| Per-run cost cap | $0.50, checked before each call against the worst case for whichever route is about to run; a timed-out request counts its worst case |
 | Output cap per call | about 1,500 tokens per customer, about 800 per unit summary |
 | Timeout per model call | 90 s |
-| Retries | none within a route; one attempt on the secondary after a timeout, 5xx, 429 or provider mismatch |
+| Retries | one primary retry after about 3 s for a timeout, 5xx or 429; then one attempt on the secondary after a timeout, 5xx, 429 or provider mismatch; at most three requests per call |
 | Run deadline | 25 min |
 | Concurrency | at most 3 model calls |
 | Month-to-date spend cap | to be decided |
@@ -195,13 +199,14 @@ It checks the `notable` flags, the expected issues, that every reference is vali
 | 0 | **Groundwork.** Shared Slack client in `src/`, `src/openrouter.js` (key check, pinned providers, no tools, JSON mode, reasoning handling, timeouts, primary/secondary fallback, served-provider check, live prices, caps), masking, external flag | built | `scripts/model-check.js` sends **invented** text to each route and checks model, provider, tokens, cost and JSON shape. Self-tests with invented data cover masking, fallback, caps and every guard |
 | 1 | **Fetch, bot compression, code-only digest** (no model calls) | built | Fetch runtime; compression ratio; masking counts on the would-be input; nothing but the digest on disk; links open the right messages |
 | 2 | **Risk extraction and unit summaries**, plus `scripts/digest-eval.js` | built | Eval passes; every claim has a valid reference; the injection is ignored; real cost |
-| 3 | **Morning schedule** (standalone launchd) | needs approval and a new healthchecks.io URL | `kickstart` run, both healthcheck pings, run row |
+| 3 | **Morning schedule** (standalone launchd) **and Slack DM delivery** (same app, bot token), primary retry, 400k run cap | built | `kickstart` run, healthcheck ping, run row, DM and file in the user's DM only |
 | 4 | **Customer registry and health** | needs approval | Blocks draw from all of a customer's channels; Red first |
 | 5 | **Leadership-contradiction check** | needs approval and the past cases | Real cases flagged with verified quotes; near-misses not flagged |
-| 6 | **Slack DM delivery** (separate app) | needs approval and the app | DMs reach only the user; other targets are refused |
+| 6 | ~~Slack DM delivery~~ | moved into phase 3 | |
 
 ## Files
-- **Code:** `src/slack.js` (shared read-only Slack client and unit rules), `src/secrets.js`, `src/openrouter.js`, `src/mask.js`, `src/digest/` (run, fetch, compress, render)
-- **Scripts:** `scripts/model-check.js`, `scripts/digest-selftest.js`, later `scripts/digest-eval.js` and `scripts/digest-customers.js`
+- **Code:** `src/slack.js` (shared read-only Slack client and unit rules), `src/slack-send.js` (send-only DM client), `src/secrets.js`, `src/healthcheck.js`, `src/openrouter.js`, `src/mask.js`, `src/digest/` (run, fetch, compress, analyze, prompts, render, dm)
+- **Schedule:** `launchd/com.lab.schedule.slack-digest.plist`
+- **Scripts:** `scripts/model-check.js`, `scripts/digest-selftest.js`, `scripts/digest-eval.js`, `scripts/digest-dm-test.js`, later `scripts/digest-customers.js`
 - **Config:** `config/slack-digest.example.json` (workspace URL, model routes, caps, noCloud), `config/slack-bus.example.json` (unit rules and external rule)
 - **Docs:** this file, `docs/slack-digest.md` (how to run it), `docs/decisions.md`, README, CLAUDE.md

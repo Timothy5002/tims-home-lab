@@ -6,10 +6,13 @@
 //   validate():  checks a model reply against the expected shape, keeps only items whose references exist in
 //                the reference map, strips anything link- or mention-like from the model's text, and counts
 //                what it dropped. The model never supplies a URL; links are built later from the reference map.
-//   analyzeAll(): runs the calls through src/openrouter.js (primary, one fallback) at most 3 at a time, under the
-//                run's input, output and cost caps.
+//   planJobs():  fits the calls into the run's input cap before any is sent: customers first, then sub-groups,
+//                busiest first within each; a call over the per-call cap keeps its newest messages; whatever does
+//                not fit is marked "not summarized (cap)" instead of aborting the run.
+//   analyzeAll(): runs the calls through src/openrouter.js (primary, one primary retry, one fallback) at most 3 at
+//                a time, under the run's input, output and cost caps.
 // Nothing here logs or stores message text or model text.
-const { chat } = require('../openrouter');
+const { chat, estimateTokens } = require('../openrouter');
 const { maskText, maskSecrets } = require('../mask');
 const { CUSTOMER_SYSTEM, UNIT_SYSTEM, renderMessages } = require('./prompts');
 
@@ -83,7 +86,53 @@ function validate(kind, reply, refMap) {
   return { points: p.items, dropped: p.dropped };
 }
 
-// jobs: [{ kind: 'customer' | 'unit', key, header, messages }]. Returns one result per job:
+// Estimated input tokens for one call, the same way the client estimates (characters / 4), with a per-message
+// allowance for the reference, time, author and JSON quoting around each message.
+const PER_MESSAGE_OVERHEAD = 15;
+function estimateJob(job) {
+  const system = job.kind === 'customer' ? CUSTOMER_SYSTEM : UNIT_SYSTEM;
+  return estimateTokens(system) + estimateTokens(job.header) + 50
+    + job.messages.reduce((t, m) => t + estimateTokens(String(m.text).slice(0, MAX_MESSAGE_CHARS)) + PER_MESSAGE_OVERHEAD, 0);
+}
+
+// jobs: [{ kind, key, header, messages (oldest first) }]. Mutates each job: est (tokens), trimmed (oldest messages
+// left out to fit the per-call cap), capSkipped (true if it did not fit the run cap). Returns totals, counts only.
+function planJobs(jobs, { runCap, callCap }) {
+  for (const j of jobs) {
+    j.trimmed = 0;
+    j.est = estimateJob(j);
+    while (j.est > callCap && j.messages.length > 1) {
+      // Drop the oldest messages in chunks until it fits; the newest are the most useful.
+      const n = Math.max(1, Math.ceil(j.messages.length * 0.1));
+      j.messages = j.messages.slice(n);
+      j.trimmed += n;
+      j.est = estimateJob(j);
+    }
+  }
+  const order = [...jobs].sort((a, b) => (a.kind === 'customer' ? 0 : 1) - (b.kind === 'customer' ? 0 : 1)
+    || (b.messages.length + b.trimmed) - (a.messages.length + a.trimmed) || b.est - a.est);
+  // Strictly in priority order: once a call does not fit, it and every quieter call are skipped, so a quieter
+  // conversation is never summarized while a busier one is not.
+  let total = 0;
+  let full = false;
+  for (const j of order) {
+    if (!full && j.est <= callCap && total + j.est <= runCap) { total += j.est; j.capSkipped = false; } else { full = true; j.capSkipped = true; }
+  }
+  const skipped = jobs.filter((j) => j.capSkipped);
+  return {
+    estimatedInputTokens: total,
+    skippedCalls: skipped.length,
+    skippedMessages: skipped.reduce((t, j) => t + j.messages.length + j.trimmed, 0),
+    trimmedCalls: jobs.filter((j) => j.trimmed && !j.capSkipped).length,
+    trimmedMessages: jobs.filter((j) => !j.capSkipped).reduce((t, j) => t + j.trimmed, 0),
+  };
+}
+
+const CAP_CODES = new Set(['input-cap', 'output-cap', 'cost-cap']);
+// True when a result was not summarized because of a cap (planned skip, or a run cap reached mid-run).
+const isCapped = (r) => Boolean(r?.capSkipped) || CAP_CODES.has(r?.error) || /^not sent: /.test(r?.error ?? '');
+
+// jobs: [{ kind: 'customer' | 'unit', key, header, messages, capSkipped? }]. Returns one result per job:
 // { key, kind, ok, refMap, items..., dropped, route, model, provider, fellBack, primaryError, error }.
 async function analyzeAll(jobs, { routes, budget, maskCounts, reasoning = false, concurrency = 3, chatImpl = chat, onDone = () => {} }) {
   const results = new Array(jobs.length);
@@ -93,8 +142,11 @@ async function analyzeAll(jobs, { routes, budget, maskCounts, reasoning = false,
     while (next < jobs.length) {
       const i = next++;
       const job = jobs[i];
+      const base = { key: job.key, kind: job.kind, messages: job.messages.length, trimmed: job.trimmed ?? 0 };
+      // Skipped calls are neither masked nor sent.
+      if (job.capSkipped) { results[i] = { ...base, ok: false, capSkipped: true, error: 'not summarized (cap)' }; onDone(results[i]); continue; }
       const { lines, refMap } = prepare(job.messages, maskCounts);
-      const base = { key: job.key, kind: job.kind, refMap, messages: job.messages.length };
+      base.refMap = refMap;
       if (stopCode) { results[i] = { ...base, ok: false, error: `not sent: ${stopCode}` }; onDone(results[i]); continue; }
       try {
         const r = await chatImpl({
@@ -103,15 +155,17 @@ async function analyzeAll(jobs, { routes, budget, maskCounts, reasoning = false,
           user: renderMessages(job.header, lines),
           maxTokens: job.kind === 'customer' ? 1500 : 800,
         });
-        const served = { route: r.route, model: r.model, provider: r.provider, fellBack: Boolean(r.fellBack), primaryError: r.primaryError ?? null, costUsd: r.costUsd, usage: r.usage };
+        const served = { route: r.route, model: r.model, provider: r.provider, fellBack: Boolean(r.fellBack), retried: Boolean(r.retried),
+          primaryError: r.primaryError ?? null, primaryErrors: r.primaryErrors ?? [], costUsd: r.costUsd, usage: r.usage };
         try {
           results[i] = { ...base, ...served, ok: true, ...validate(job.kind, r.json, refMap) };
         } catch (e) {
           results[i] = { ...base, ...served, ok: false, error: e.code ?? 'bad-shape' };
         }
       } catch (e) {
-        if (['input-cap', 'output-cap', 'cost-cap'].includes(e.code)) stopCode = e.code;
-        results[i] = { ...base, ok: false, error: e.code ?? 'error', route: e.result?.route ?? null, provider: e.result?.provider ?? null };
+        if (CAP_CODES.has(e.code)) stopCode = e.code;
+        results[i] = { ...base, ok: false, error: e.code ?? 'error', route: e.result?.route ?? null, provider: e.result?.provider ?? null,
+          fellBack: Boolean(e.fellBack), primaryErrors: e.primaryErrors ?? [] };
       }
       onDone(results[i]);
     }
@@ -120,4 +174,4 @@ async function analyzeAll(jobs, { routes, budget, maskCounts, reasoning = false,
   return results;
 }
 
-module.exports = { prepare, validate, sanitize, analyzeAll, ShapeError };
+module.exports = { prepare, validate, sanitize, analyzeAll, planJobs, estimateJob, isCapped, ShapeError };

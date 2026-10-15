@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Daily Slack digest at 06:00 local time. Approved exception: runs src/digest/run.js directly, not through the
+     dispatcher (a run takes minutes, over the 60s job limit). The script pings its own healthcheck. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.lab.schedule.slack-digest</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/node</string>
+    <string>/Users/timothyspray/main/src/digest/run.js</string>
+    <string>--scheduled</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/timothyspray/main</string>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>6</integer>
+    <key>Minute</key><integer>0</integer>
+  </dict>
+  <key>StandardOutPath</key><string>/Users/timothyspray/Library/Logs/lab-dispatcher/schedule-slack-digest.log</string>
+  <key>StandardErrorPath</key><string>/Users/timothyspray/Library/Logs/lab-dispatcher/schedule-slack-digest.log</string>
+</dict>
+</plist>

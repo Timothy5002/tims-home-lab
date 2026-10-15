@@ -18,8 +18,10 @@ Optional, for jobs that use the LLM helper: Ollama from Homebrew (`brew services
 | `~/.lab/healthcheck-url-<job>` | healthchecks.io ping URL for that job's schedule (600) |
 | `~/.lab/slack-token` | Read-only Slack user token for the Slack measurement scripts and the digest (600) |
 | `~/.lab/openrouter-key` | OpenRouter API key for the Slack digest (600); its monthly spend limit is set in OpenRouter's dashboard |
+| `~/.lab/slack-bot-token` | Bot token of the same Slack app, used only to send the digest DM to you (600) |
+| `~/.lab/healthcheck-url-slack-digest` | The digest's own healthchecks.io ping URL (600) |
 | `~/Library/LaunchAgents/com.lab.*.plist` | Installed copies of `launchd/*.plist` |
-| `~/Library/Logs/lab-dispatcher/` | `out.log`, `err.log` (service), `schedule-<job>.log` (scheduled runs) |
+| `~/Library/Logs/lab-dispatcher/` | `out.log`, `err.log` (service), `schedule-<job>.log` (scheduled runs), `schedule-slack-digest.log` (digest stats only) |
 
 ## Everyday commands
 ```bash
@@ -31,7 +33,12 @@ sqlite3 -header -column data/dispatcher.db "select * from runs order by id desc 
 node scripts/llm-eval.js                                                   # check the LLM prompt templates
 curl -s 127.0.0.1:11434/api/ps                                             # is the model loaded right now?
 node scripts/slack-channels.js && node scripts/slack-measure.js            # Slack volume; see docs/slack-measurement.md
+launchctl kickstart -k gui/$(id -u)/com.lab.schedule.slack-digest          # run the Slack digest now (records, delivers, pings)
+tail -n 60 ~/Library/Logs/lab-dispatcher/schedule-slack-digest.log         # digest stats (never message text)
+node scripts/digest-dm-test.js                                             # send one invented line to your DM; prints stats
+node scripts/digest-selftest.js                                            # digest guard tests (no network)
 ```
+The digest keeps the newest 14 files in `data/digests/` and deletes older ones; its last success is in `data/digest-state.json`. See [slack-digest.md](slack-digest.md).
 After editing a file in `launchd/`, reinstall it with `scripts/install-agent.sh launchd/<file>.plist`. After editing `src/`, restart the dispatcher with the `kickstart -k` command above.
 
 ## Troubleshooting
@@ -46,3 +53,6 @@ After editing a file in `launchd/`, reinstall it with `scripts/install-agent.sh 
 | `disk-check` fails | Free space on the internal drive is under 25% or under 40 GB; the job's output (in `schedule-disk-check.log` and the healthchecks.io ping body) shows the numbers |
 | `disk-check` lists `Library`, `Documents` etc. as unreadable | Expected. Jobs run under launchd's `node`, which macOS privacy does not let into protected folders, and Full Disk Access is deliberately not granted. Free space is still exact; only the folder list is incomplete |
 | Nothing runs after a reboot | Auto-login is off, or the agent isn't installed in `~/Library/LaunchAgents/` |
+| Digest healthcheck is down, log says `delivery-failed` | The digest file was still written. The `delivery.code` in the log is Slack's error code: `missing_scope` (add the scope in the Slack app and reinstall it), `invalid_auth` or `bot-token` (check `~/.lab/slack-bot-token`, mode 600), `dm-mismatch` (Slack returned a DM that is not yours; nothing was posted) |
+| Digest log says `not summarized (cap)` or the footer counts calls over the cap | The window held more than the 400k-token run cap (for example after several missed days); the busiest customers were summarized and the rest listed with counts |
+| Digest ran but the healthcheck shows `/fail` with `deadline` | The run passed 25 minutes; usually Slack rate limits. No digest was written and the last success did not move |

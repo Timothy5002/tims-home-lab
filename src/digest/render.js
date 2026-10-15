@@ -4,6 +4,7 @@
 // customer sub-group comes first, and quiet customers collapse to one line. Every snippet links to its message;
 // links are built in code (src/slack.js permalink).
 const { permalink } = require('../slack');
+const { isCapped } = require('./analyze');
 
 const SNIPPET = 160;
 
@@ -131,11 +132,13 @@ function renderCustomers(s, ctx) {
   const notable = [];
   const nothing = [];
   const failed = [];
+  const capped = [];
   const notSent = [];
   for (const b of s.blocks) {
     if (b.conv.noCloud) { notSent.push(b); continue; }
     const r = results.get(b.conv.id);
-    if (!r || !r.ok) failed.push({ b, error: r?.error ?? 'not analyzed' });
+    if (isCapped(r)) capped.push(b);
+    else if (!r || !r.ok) failed.push({ b, error: r?.error ?? 'not analyzed' });
     else if (r.notable) notable.push({ b, r });
     else nothing.push(b);
   }
@@ -143,7 +146,7 @@ function renderCustomers(s, ctx) {
   notable.sort((x, y) => top(x.r) - top(y.r) || count(y.b) - count(x.b));
   out.push('', `### ${s.sub ?? 'Customers'}: ${notable.length} with something notable, ${nothing.length} active with nothing notable, ${s.quiet.length} quiet`);
   for (const { b, r } of notable) {
-    out.push('', `#### ${convLabel(b.conv, ctx.me)}${b.conv.external ? ' (external)' : ''}: ${count(b)} messages`);
+    out.push('', `#### ${convLabel(b.conv, ctx.me)}${b.conv.external ? ' (external)' : ''}: ${count(b)} messages${r.trimmed ? ` (oldest ${r.trimmed} not read: per-call cap)` : ''}`);
     if (r.wentWrong.length) {
       out.push('What went wrong:');
       for (const i of r.wentWrong) out.push(`- [${i.severity}] ${i.summary} ${refLinks(i.refs, r.refMap, ctx)}`);
@@ -156,6 +159,7 @@ function renderCustomers(s, ctx) {
   if (nothing.length) out.push('', `Nothing notable: ${nothing.map((b) => `${convLabel(b.conv, ctx.me)} (${count(b)})`).join(', ')}`);
   if (s.quiet.length) out.push('', `Quiet: ${s.quiet.map((c) => convLabel(c, ctx.me)).join(', ')}`);
   if (notSent.length) out.push('', `Not summarized (noCloud): ${notSent.map((b) => `${convLabel(b.conv, ctx.me)} (${count(b)} messages)`).join(', ')}`);
+  if (capped.length) out.push('', `Not summarized (cap): ${capped.length} ${capped.length === 1 ? 'customer' : 'customers'}, ${capped.reduce((t, b) => t + count(b), 0)} messages: ${capped.map((b) => `${convLabel(b.conv, ctx.me)} (${count(b)})`).join(', ')}`);
   if (failed.length) out.push('', `Not analyzed: ${failed.map(({ b, error }) => `${convLabel(b.conv, ctx.me)} (${count(b)} messages; ${error})`).join(', ')}`);
   if (s.errors.length) out.push('', `Could not read: ${s.errors.map((e) => `${convLabel(e.conv, ctx.me)} (${e.error})`).join(', ')}`);
   return out;
@@ -167,7 +171,10 @@ function renderUnitSummary(s, ctx) {
   const notSent = s.blocks.filter((b) => b.conv.noCloud);
   out.push('', `### ${s.sub ?? '(no sub-group)'}: ${s.blocks.length} active${s.quiet.length ? `, ${s.quiet.length} quiet` : ''}`);
   const r = s.analysis;
-  if (sent.length && r?.ok) {
+  if (sent.length && isCapped(r)) {
+    out.push(`- Not summarized (cap): ${sent.length} ${sent.length === 1 ? 'conversation' : 'conversations'}, ${sent.reduce((t, b) => t + count(b), 0)} messages.`);
+  } else if (sent.length && r?.ok) {
+    if (r.trimmed) out.push(`- (Oldest ${r.trimmed} messages not read: per-call cap.)`);
     if (r.points.length) for (const p of r.points) out.push(`- ${p.summary} ${refLinks(p.refs, r.refMap, ctx)}`);
     else out.push('- Nothing notable.');
   } else if (sent.length) {
@@ -179,4 +186,4 @@ function renderUnitSummary(s, ctx) {
   return out;
 }
 
-module.exports = { renderDigest, renderConversation, snippet, convLabel };
+module.exports = { renderDigest, renderConversation, snippet, convLabel, refLinks, LEVEL_ORDER };

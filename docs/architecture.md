@@ -4,6 +4,7 @@
 - **Dispatcher (`src/server.js`)**: a Fastify HTTP service bound to `127.0.0.1:8787` only. Managed by the `com.lab.dispatcher` LaunchAgent (RunAtLoad + KeepAlive).
 - **Run log (`src/db.js`)**: SQLite database `data/dispatcher.db`, table `runs`.
 - **Scheduler wrapper (`src/schedule-run.js`)**: invoked by launchd calendar agents. It is a client of the dispatcher, not part of it.
+- **The one exception: the Slack digest** (`com.lab.schedule.slack-digest`) runs `src/digest/run.js --scheduled` directly at 06:00, because a run takes minutes. It writes its own run row (source `launchd-direct`) and pings its own healthcheck through `src/healthcheck.js`. See `docs/slack-digest.md`.
 - **Jobs (`jobs/*.sh`)**: the executable allowlist.
 - **LLM helper (`src/llm.js`, templates in `src/llm-prompts.js`)**: a command-line tool that jobs call to classify, extract or summarize text. It is not part of the server; a job runs it as a child process. It talks only to the local Ollama service (Homebrew, `127.0.0.1:11434`, model `qwen2.5:7b`).
 
