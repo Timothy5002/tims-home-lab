@@ -1,9 +1,10 @@
 'use strict';
 // Self-tests for the Slack digest's guard code, using invented text only: masking (src/mask.js), the OpenRouter
 // client's guards, primary retry and primary/secondary fallback (src/openrouter.js, with a fake API so nothing
-// leaves the Mac), the run and per-call caps (src/digest/analyze.js), the send-only Slack client and the DM
-// (src/slack-send.js, src/digest/dm.js, fake Slack), the healthcheck helper, the secret-file check, and bot
-// compression (src/digest/compress.js). Run after changing any of them: node scripts/digest-selftest.js
+// leaves the Mac), validation and the noise rules, the customer registry and mention matching, the pipeline end to
+// end with a stubbed model (merging, Leadership flag, fallback, unit modes, own conversations, incidents), the run
+// and per-call caps, the archive file, the DM and the send-only Slack client (fake Slack), the healthcheck helper,
+// the secret-file check, and bot compression (src/digest/compress.js). Run after changing any of them: node scripts/digest-selftest.js
 // Prints one line per case; exits non-zero if any case fails.
 const fs = require('node:fs');
 const os = require('node:os');
@@ -229,6 +230,14 @@ const hang = (init) => new Promise((_, reject) => {
       JSON.stringify({ route: r.route, slept, n: f.calls.chat.length }));
   }
   {
+    const f = fakeOpenRouter([json(429, {}), { content: '{}', provider: 'Google' }, { content: '{}', provider: 'Google' }]);
+    const r = await chat({ ...base, fetchImpl: f, only: 'secondary' });
+    const f2 = fakeOpenRouter([json(503, {}), json(503, {}), { content: '{}', provider: 'Google' }]);
+    const e2 = await errOf(chat({ ...base, fetchImpl: f2, only: 'primary' }));
+    check('openrouter: a single-route call (only) gets the one retry and never falls back',
+      r.route === 'secondary' && r.retried && f.calls.chat.length === 2 && e2?.code === 'server-error' && f2.calls.chat.length === 2, `${f.calls.chat.length}, ${f2.calls.chat.length}`);
+  }
+  {
     const slept = [];
     const f = fakeOpenRouter([json(429, {}, { 'retry-after': '60' }), { content: '{}', provider: 'DeepInfra' }]);
     await chat({ ...base, fetchImpl: f, sleepImpl: async (ms) => { slept.push(ms); } });
@@ -324,52 +333,59 @@ const hang = (init) => new Promise((_, reject) => {
     check('openrouter: JSON mode requires the word json in the prompt', e3?.code === 'bad-request');
   }
 
-  // ---------- Phase 2: preparation, validation, sanitizing, caps, links (invented data, stubbed model) ----------
+  // ---------- Validation and the noise rules (invented data) ----------
   {
     const { prepare, validate, sanitize, analyzeAll } = require('../src/digest/analyze');
-    const { renderDigest } = require('../src/digest/render');
     const ext = { id: 'C-EXT', external: true };
     const int = { id: 'C-INT', external: false };
     const counts = newCounts();
     const { lines, refMap } = prepare([
       { conv: ext, ts: '100.000001', who: 'Pat', text: 'mail pat@example.test, call 555-123-4567' },
       { conv: int, ts: '200.000002', who: 'Sam', text: 'mail sam@example.test, key sk-abcdefghijklmnop1234', threadTs: '150.000000' },
+      { conv: int, ts: '300.000003', who: 'RiskBot (bot)', text: 'Risk: invented renewal at risk', bot: true },
     ], counts);
-    check('phase2: references m001.. map to conversation and timestamp', lines[0].ref === 'm001' && refMap.get('m002').conv === 'C-INT' && refMap.get('m002').threadTs === '150.000000');
-    check('phase2: external text fully masked, internal only secrets, names kept',
+    check('validate: references m001.. map to conversation, timestamp and bot flag', lines[0].ref === 'm001' && refMap.get('m002').conv === 'C-INT' && refMap.get('m002').threadTs === '150.000000' && refMap.get('m003').bot === true);
+    check('validate: external text fully masked, internal only secrets, names kept',
       lines[0].text === 'mail [email], call [phone]' && lines[1].text === 'mail sam@example.test, key [secret]' && lines[0].who === 'Pat' && counts.email === 1 && counts.secret === 1, JSON.stringify(lines));
-    const v = validate('customer', {
-      went_wrong: [
-        { summary: 'Calls dropped', severity: 'HIGH', refs: ['m001', 'm999'] },
-        { summary: 'Invented with no source', severity: 'high', refs: [] },
-        { summary: 'Made-up reference', severity: 'low', refs: ['m777'] },
-      ],
-      risks: [{ summary: '  ', likelihood: 'high', refs: ['m002'] }],
-      notable: true,
-    }, refMap);
-    check('phase2: only cited items survive; unknown refs removed; drops counted',
-      v.wentWrong.length === 1 && v.wentWrong[0].refs.join() === 'm001' && v.wentWrong[0].severity === 'high' && v.risks.length === 0 && v.dropped === 3, JSON.stringify(v));
-    const v2 = validate('customer', { went_wrong: [{ summary: 'x', refs: ['m404'] }], risks: [], notable: true }, refMap);
-    check('phase2: "notable" is decided by code, not the model', v2.notable === false && v2.dropped === 1);
-    const six = Array.from({ length: 6 }, (_, i) => ({ summary: `p${i}`, refs: ['m001'] }));
-    check('phase2: at most 5 items per list', validate('unit', { points: six }, refMap).points.length === 5);
+    const v = validate('customer', { items: [
+      { summary: 'Calls dropped', kind: 'problem', severity: 'HIGH', category: 'incident', refs: ['m001', 'm999'] },
+      { summary: 'Invented with no source', severity: 'high', category: 'incident', refs: [] },
+      { summary: 'EOD report not posted', severity: 'low', category: 'bot-hygiene', refs: ['m003'] },
+      { summary: 'An employee was late again', severity: 'medium', category: 'personnel', refs: ['m002'] },
+      { summary: 'Thanks for the call', severity: 'low', category: 'other', refs: ['m002'] },
+      { summary: 'Renewal at risk per the risk report', kind: 'risk', severity: 'medium', category: 'commercial', refs: ['m003'] },
+    ] }, refMap);
+    check('noise: only cited evidence items survive; bot hygiene, personnel and other are dropped and counted',
+      v.items.length === 2 && v.items[0].refs.join() === 'm001' && v.items[0].severity === 'high' && v.drops.badRef === 1 && v.drops.botHygiene === 1
+      && v.drops.personnel === 1 && v.drops.notEvidence === 1 && v.dropped === 4, JSON.stringify(v));
+    check('noise: an item resting only on bot posts is labeled a bot report (in code)', v.items[1].botReport === true && v.items[0].botReport === false);
+    const v2 = validate('customer', { items: [{ summary: 'x', category: 'incident', refs: ['m404'] }] }, refMap);
+    check('validate: "notable" is decided by code, not the model', v2.notable === false && v2.dropped === 1);
+    const six = Array.from({ length: 6 }, (_, i) => ({ summary: `p${i}`, category: 'work', refs: ['m001'] }));
+    check('validate: at most 5 unit points, 3 brief points', validate('unit', { points: six }, refMap).points.length === 5 && validate('brief', { points: six }, refMap).points.length === 3);
+    check('validate: brief items cut to 12 words', validate('brief', { points: [{ summary: 'one two three four five six seven eight nine ten eleven twelve thirteen fourteen', category: 'work', refs: ['m001'] }] }, refMap).points[0].summary.split(' ').length === 12);
+    check('validate: personnel points are dropped from unit summaries too', validate('unit', { points: [{ summary: 'Invented discipline matter', category: 'personnel', refs: ['m002'] }] }, refMap).points.length === 0);
     let shapeErr = null;
-    try { validate('customer', { went_wrong: 'oops' }, refMap); } catch (e) { shapeErr = e.code; }
-    check('phase2: a wrong shape is rejected', shapeErr === 'bad-shape');
+    try { validate('customer', { items: 'oops' }, refMap); } catch (e) { shapeErr = e.code; }
+    check('validate: a wrong shape is rejected', shapeErr === 'bad-shape');
     const dirty = 'See <https://evil.test/x|here>, [click](https://evil.test) or https://evil.test/a and www.evil.test, ping <@U123> <!channel> @everyone, mail a@b.test';
     const clean = sanitize(dirty);
-    check('phase2: model text loses links, mentions, emails and markup', !/https?:|www\.|evil\.test|<|@|\]\(/.test(clean), clean);
-    // Links come only from the reference map.
-    const res = new Map([['C-EXT', { ok: true, notable: true, refMap, dropped: 0,
-      wentWrong: [{ summary: sanitize('Outage https://evil.test'), severity: 'high', refs: ['m002'] }], risks: [] }]]);
-    const md = renderDigest({
-      units: [{ bu: 'Unit B', subs: [{ sub: 'Customers', blocks: [{ conv: { id: 'C-EXT', name: 'success-acme', type: 'public', external: false }, compressed: { stats: { messagesIn: 3 } } }], quiet: [], errors: [], analysis: res }] }],
-      window: { start: 0, end: 86400, hours: 24, reason: 'test' }, footer: [],
-      ctx: { workspaceUrl: 'https://ws.example.test', analyzed: true, writtenBy: 'model X via Provider Y', nameOf: () => '' }, customerKey: { bu: 'Unit B', sub: 'Customers' },
-    });
-    const urls = md.match(/https?:\/\/[^\s)]+/g) ?? [];
-    check('phase2: every link in the digest is a code-built Slack link',
-      urls.length === 1 && urls[0] === 'https://ws.example.test/archives/C-INT/p200000002?thread_ts=150.000000&cid=C-INT' && md.includes('Written by: model X via Provider Y'), urls.join(' '));
+    check('validate: model text loses links, mentions, emails and markup', !/https?:|www\.|evil\.test|<|@|\]\(/.test(clean), clean);
+    // Synthesis: code decides severity, the Leadership flag and the best evidence; the headline is cut to 20 words.
+    const sp = prepare([
+      { conv: int, ts: '1.0', who: 'Pat', text: 'a' },
+      { conv: { id: 'C-LEAD', external: false }, ts: '2.0', who: 'Dana', text: 'b', mention: 'leadership' },
+    ], newCounts(), 's');
+    const sv = validate('synth', { headline: Array.from({ length: 30 }, (_, i) => `w${i}`).join(' '), points: [
+      { summary: 'Medium point', severity: 'medium', category: 'deadline', refs: ['s001'] },
+      { summary: 'Personnel point', severity: 'high', category: 'personnel', refs: ['s002'] },
+    ] }, sp.refMap);
+    check('synthesis: severity is the strongest kept point, not the model\'s claim; headline at most 20 words',
+      sv.severity === 'medium' && sv.headline.split(' ').length === 20 && sv.bestRef === 's001' && sv.leadership === false, JSON.stringify(sv));
+    const sv2 = validate('synth', { headline: 'h', points: [{ summary: 'Leadership asked for an owner', severity: 'medium', category: 'ownership', refs: ['s002'] }] }, sp.refMap);
+    check('synthesis: Leadership flag only when a kept point cites a Leadership message', sv2.leadership === true);
+    check('incident: null and a cited incident both validate', validate('incident', { incident: null }, refMap).incident === null
+      && validate('incident', { incident: { summary: 'Calls failing for all customers', refs: ['m001'] } }, refMap).incident.refs[0] === 'm001');
     // A run-level cap stops the remaining calls; a bad reply shape fails only its own job.
     const jobs = [0, 1, 2].map((i) => ({ kind: 'unit', key: `k${i}`, header: 'h', messages: [{ conv: int, ts: `${i}.0`, who: 'x', text: 'y' }] }));
     let n = 0;
@@ -379,14 +395,154 @@ const hang = (init) => new Promise((_, reject) => {
       const e = new Error('cap'); e.code = 'cost-cap'; throw e;
     };
     const out = await analyzeAll(jobs, { routes: {}, budget: null, maskCounts: newCounts(), concurrency: 1, chatImpl: stub });
-    check('phase2: bad shape fails one job; a cost cap stops the rest without calling',
+    check('validate: bad shape fails one job; a cost cap stops the rest without calling',
       out[0].error === 'bad-shape' && out[1].error === 'cost-cap' && out[2].error === 'not sent: cost-cap' && n === 2, JSON.stringify(out.map((o) => o.error)));
   }
 
-  // ---------- Caps: an oversized invented window (phase 3) ----------
+  // ---------- Customer registry (invented names) ----------
+  const { buildRegistry, mentionedCustomers } = require('../src/digest/customers');
+  const REG_CFG = {
+    customerSources: ['Unit B > Success', 'Unit B > Customer channels'], anchorSources: ['Unit B > Success'],
+    mentionSources: [{ unit: 'Unit B > Leadership', leadership: true }, { unit: 'Unit B > Internal', leadership: false }],
+    stripPrefixes: ['success-', 'partner-and-'], stripSuffixes: ['-ourco-coordination', '-coordination', '-external'],
+    dropWords: new Set(['ourco', 'and', 'coordination', 'external']), minContainLength: 5, minAliasLength: 4,
+    customers: { birchhealth: { name: 'Birch Health', keys: ['birchhq'], aliases: ['Birch'] } },
+    notCustomers: new Set(['partner-updates']), noMention: new Set(),
+  };
+  const ch = (id, name, sub, type = 'public') => ({ id, name, type, bu: 'Unit B', sub, label: `#${name}` });
+  const REG_CONVS = [
+    ch('S1', 'success-acme-corp', 'Success'), ch('S2', 'success-birch-health', 'Success'), ch('S3', 'success-ash', 'Success'),
+    ch('X1', 'acmecorp-ourco-coordination', 'Customer channels'), ch('X2', 'partner-and-acme-corp-external', 'Customer channels'),
+    ch('X3', 'birchhq-coordination', 'Customer channels'), ch('X4', 'zenith-coordination', 'Customer channels'),
+    ch('X5', 'partner-and-zenith', 'Customer channels'), ch('X6', 'partner-updates', 'Customer channels'),
+    { id: 'G1', name: 'mpdm-a--b-1', type: 'group_dm', bu: 'Unit B', sub: 'Customer channels', label: 'DM: A, B' },
+    ch('L1', 'leadership', 'Leadership'), ch('I1', 'team-internal', 'Internal'), ch('O1', 'ops', 'Ops'),
+  ];
+  {
+    const reg = buildRegistry(REG_CONVS, REG_CFG);
+    const cust = (k) => reg.customers.find((c) => c.key === k);
+    check('registry: success channels define customers; coordination and external channels join by key',
+      JSON.stringify(cust('acmecorp')?.convIds) === '["S1","X1","X2"]' && cust('acmecorp').name === 'Acme Corp', JSON.stringify(cust('acmecorp')));
+    check('registry: a configured extra key joins a differently spelled channel', JSON.stringify(cust('birchhealth')?.convIds) === '["S2","X3"]' && cust('birchhealth').name === 'Birch Health');
+    const z = reg.customers.find((c) => c.key === 'unmatched:zenith');
+    check('registry: channels matching no customer are listed, grouped by key, and still get a record',
+      z?.unmatched && JSON.stringify(z.convIds) === '["X4","X5"]' && reg.unmatched.length === 3 && reg.customers.some((c) => c.key === 'unmatched:G1'), JSON.stringify(reg.unmatched.map((u) => u.conv.id)));
+    check('registry: general channels are not customers', reg.general.map((c) => c.id).join() === 'X6' && !reg.byConv.has('X6'));
+    check('registry: mention channels with the Leadership flag', reg.mentionConvs.get('L1') === 'leadership' && reg.mentionConvs.get('I1') === 'internal' && !reg.mentionConvs.has('O1'));
+    check('registry: automatic aliases skip short names (set those by hand)', cust('ash').aliases.length === 0 && cust('acmecorp').aliases.includes('acme corp'));
+    const m = (t) => mentionedCustomers(t, reg).sort().join();
+    check('mentions: whole-word, case-insensitive, hyphen or space or nothing between words',
+      m('Is ACME-Corp ok?') === 'acmecorp' && m('acmecorp renewal') === 'acmecorp' && m('Birch is unhappy') === 'birchhealth' && m('birchwood trees') === '' && m('the acme corporation') === '', [m('Is ACME-Corp ok?'), m('birchwood trees'), m('the acme corporation')].join('|'));
+  }
+
+  // ---------- The pipeline end to end, stubbed model (invented data) ----------
+  const { runPipeline } = require('../src/digest/pipeline');
+  const P = require('../src/digest/prompts');
+  const ME = 'U0INVENTED1';
+  const comp = (humans, bots = []) => ({ humans, botGroups: bots, stats: { messagesIn: humans.length + bots.reduce((t, g) => t + g.count, 0), botMessagesIn: bots.reduce((t, g) => t + g.count, 0) } });
+  const hm = (ts, user, text) => ({ ts, user, text, threadTs: null });
+  const blk = (conv, compressed) => ({ conv: { external: false, noCloud: false, ...conv }, compressed, error: null });
+  function pipelineBlocks() {
+    const c = Object.fromEntries(REG_CONVS.map((x) => [x.id, x]));
+    return [
+      blk(c.S1, comp([hm('10.0', 'U1', 'Calls failed all morning for Acme'), hm('11.0', 'U2', 'Looking')])),
+      blk(c.X1, comp([hm('12.0', 'U1', 'Acme says this risks the renewal')])),
+      blk(c.S2, comp([hm('13.0', 'U3', 'Birch report is late')])),
+      blk(c.S3, comp([])),
+      blk(c.L1, comp([hm('14.0', 'U4', 'Acme Corp is unhappy, who owns this?'), hm('14.5', 'U4', 'Unrelated leadership topic')])),
+      blk({ ...c.I1, bu: 'Internal', sub: 'Eng', label: '#eng' }, comp([hm('15.0', 'U5', 'Outbound calls failing for all customers')])),
+      blk({ id: 'A1', name: 'sales', type: 'public', bu: 'Unit A', sub: null, label: '#sales' }, comp([hm('16.0', 'U6', 'Signed a renewal')], [{ botName: 'EODBot', count: 4, examples: [{ ts: '16.5', text: 'EOD report not posted' }], alerts: [] }])),
+      blk({ id: 'A2', name: 'my-notes', type: 'public', bu: 'Unit A', sub: null, label: '#my-notes' }, comp([hm('17.0', ME, 'My plan for today'), hm('17.1', ME, 'More of my plan'), hm('17.2', 'U6', 'ok')])),
+    ];
+  }
+  const MODES = { 'Unit B > Success': 'full', 'Unit B > Customer channels': 'full', 'Unit B > Leadership': 'full', 'Unit B > Internal': 'off', 'Unit A': 'brief', Internal: 'off' };
+  function stubChat(log) {
+    return async (o) => {
+      log.push(o.system === P.CUSTOMER_SYSTEM ? 'customer' : o.system === P.SYNTH_SYSTEM ? 'synth' : o.system === P.BRIEF_SYSTEM ? 'brief' : o.system === P.INCIDENT_SYSTEM ? 'incident' : 'unit');
+      log.users = [...(log.users ?? []), o.user];
+      const r = { route: 'primary', model: 'm', provider: 'P', usage: { prompt: 10, completion: 5 }, costUsd: 0.0001 };
+      if (o.system === P.CUSTOMER_SYSTEM) {
+        if (o.user.includes('Birch')) return { ...r, json: { items: [{ summary: 'Birch report late', kind: 'problem', severity: 'medium', category: 'deadline', refs: ['m001'] },
+          { summary: 'Invented low note', kind: 'risk', severity: 'low', category: 'sentiment', refs: ['m001'] }] } };
+        if (o.user.includes('renewal')) return { ...r, json: { items: [{ summary: 'Renewal at risk', kind: 'risk', severity: 'high', category: 'commercial', refs: ['m001'] }] } };
+        return { ...r, json: { items: [{ summary: 'Calls failed all morning', kind: 'problem', severity: 'high', category: 'incident', refs: ['m001'] },
+          { summary: 'An agent was rude, discipline them', kind: 'problem', severity: 'medium', category: 'personnel', refs: ['m002'] }] } };
+      }
+      if (o.system === P.SYNTH_SYSTEM) {
+        if (o.user.includes('Birch')) { const e = new Error('server'); e.code = 'server-error'; throw e; }
+        const lead = o.user.match(/(s\d{3}) \[[^\]]+\] [^\n]*\(leadership\)/)?.[1];
+        return { ...r, json: { headline: 'Repeated call failures put the Acme renewal at risk and leadership wants an owner', points: [
+          { summary: 'Calls failed all morning', severity: 'high', category: 'incident', refs: ['s001'] },
+          { summary: 'Renewal at risk', severity: 'high', category: 'commercial', refs: ['s002'] },
+          { summary: 'Leadership asked who owns it', severity: 'medium', category: 'ownership', refs: [lead] },
+          { summary: 'Minor invented note', severity: 'low', category: 'sentiment', refs: ['s001'] }] } };
+      }
+      if (o.system === P.BRIEF_SYSTEM) return { ...r, json: { points: [{ summary: 'Renewal signed', category: 'work', refs: ['m001'] }] } };
+      if (o.system === P.INCIDENT_SYSTEM) return { ...r, json: o.user.includes('Outbound') ? { incident: { summary: 'Outbound calls failed for all customers', refs: ['m001'] } } : { incident: null } };
+      return { ...r, json: { points: [{ summary: 'Leadership topic', category: 'work', refs: ['m001'] }] } };
+    };
+  }
+  async function runStubPipeline(extra = {}) {
+    const log = [];
+    const reg = buildRegistry(REG_CONVS, REG_CFG);
+    const model = await runPipeline({ blocks: pipelineBlocks(), registry: reg, modes: MODES, me: ME, nameOf: (id) => `Person ${id}`, routes: {}, budget: null,
+      maskCounts: newCounts(), runCap: 400_000, callCap: 100_000, chatImpl: stubChat(log), ...extra });
+    return { model, log };
+  }
+  {
+    const { model, log } = await runStubPipeline();
+    const acme = model.records.find((r) => r.key === 'acmecorp');
+    const birch = model.records.find((r) => r.key === 'birchhealth');
+    check('pipeline: one record per customer, merged across its channels', model.records.filter((r) => r.key === 'acmecorp').length === 1 && acme.merged && acme.convs.length === 2, JSON.stringify(acme?.convs));
+    check('pipeline: Leadership mentions reach the synthesis; flag set from the cited message', acme.leadership === true && acme.leadershipMentions === 1 && acme.mentions === 1);
+    check('pipeline: personnel item from stage 1 dropped and counted', model.skipped.personnel === 1 && !JSON.stringify(acme.points).includes('rude'));
+    check('pipeline: record severity high, ranked first, best evidence is the strongest point\'s message', model.records[0].key === 'acmecorp' && acme.severity === 'high' && acme.best.conv === 'S1');
+    check('pipeline: failed synthesis falls back to stage-1 findings, not merged', birch.notable && !birch.merged && birch.synthError === 'server-error' && birch.severity === 'medium');
+    check('pipeline: your own conversation is left out of the brief summary', model.skipped.ownConversations === 1 && !(log.users ?? []).some((u) => u.includes('My plan')));
+    check('pipeline: brief unit, full Leadership summary and off-unit incident check each made', log.includes('brief') && log.includes('unit') && log.filter((k) => k === 'incident').length === 1);
+    check('pipeline: an off-unit incident and customer incidents are listed', model.incidents.some((i) => i.source === 'Internal') && model.incidents.some((i) => i.source === 'Acme Corp'));
+    check('pipeline: bot posts and quiet channels counted as skipped', model.skipped.botPosts === 4 && model.skipped.quietConversations === 1);
+    // The archive file keeps low items and builds every link in code.
+    const { renderArchive } = require('../src/digest/render');
+    const md = renderArchive({ model, window: { start: 0, end: 86400, hours: 24, reason: 'test' }, footer: ['- footer'], ctx: { workspaceUrl: 'https://ws.example.test', writtenBy: 'm via P' } });
+    const urls = md.match(/https?:\/\/[^\s)]+/g) ?? [];
+    check('archive: merged by customer, low items kept, Leadership flagged, every link code-built',
+      md.includes('### Acme Corp (HIGH · also discussed in Leadership)') && md.includes('Minor invented note') && md.includes('not merged (server-error)')
+      && urls.length > 0 && urls.every((u) => u.startsWith('https://ws.example.test/archives/')), urls.join(' '));
+
+    // ---------- The DM (top-level and thread) ----------
+    const { buildDm, TOP_MAX } = require('../src/digest/dm');
+    const ctx = { workspaceUrl: 'https://ws.example.test', writtenBy: 'm via P' };
+    const dm = buildDm({ model, window: { start: 0, end: 86400, hours: 24 }, ctx, footer: ['Model: m via P', '$0.0100'] });
+    const t = dm.top;
+    check('dm: sections in order: title, Needs attention, Watch-or-not, Incident, Other units, Skipped',
+      /^\*Slack digest · /.test(t) && t.indexOf('*Needs attention*') < t.indexOf('*Incident*') && t.indexOf('*Incident*') < t.indexOf('*Other units*') && t.indexOf('*Other units*') < t.indexOf('*Skipped*'), t);
+    check('dm: needs-attention line: bold name, icon, headline, one link', /• \*Acme Corp\* 🔴 Repeated call failures .* <https:\/\/ws\.example\.test\/archives\/S1\/p100\|›>/.test(t), t);
+    check('dm: low items never in the DM or thread; model and cost only in the thread', !t.includes('Minor invented') && !dm.thread.includes('Minor invented') && !t.includes('Model:') && dm.thread.includes('Model: m via P'));
+    check('dm: skipped line counts bot posts and quiet channels', /\*Skipped\*: 0 bot-hygiene items, 4 bot posts, 1 quiet channel/.test(t), t.split('\n').at(-1));
+    check('dm: thread has per-customer bullets with links and the Leadership note', dm.thread.includes('*Acme Corp* 🔴') && dm.thread.includes('(also discussed in Leadership)') && /<https:\/\/ws\.example\.test\/archives\/[^|]+\|1>/.test(dm.thread));
+    // Many long customers: the top-level stays under the hard cap, at most 5 need attention, each customer once.
+    const many = { ...model, records: Array.from({ length: 14 }, (_, i) => ({ ...model.records[0], key: `k${i}`, name: `Invented Customer ${i} <&>`,
+      headline: `Invented headline number ${i} with quite a few words to make it long enough to matter here`, severity: i < 6 ? 'high' : 'medium' })) };
+    const big = buildDm({ model: many, window: { start: 0, end: 86400, hours: 24 }, ctx, footer: ['x'] });
+    const names = [...big.top.matchAll(/Invented Customer (\d+)/g)].map((x) => x[1]);
+    check('dm: hard cap of 1,500 characters; at most 5 in Needs attention; each customer once', big.top.length <= TOP_MAX && big.stats.needsAttention <= 5
+      && new Set(names).size === names.length && names.length === 14, `${big.top.length} chars, ${big.stats.needsAttention} attention, ${names.length} names`);
+    check('dm: names and model text are escaped for Slack', big.top.includes('&lt;&amp;&gt;') && !big.top.includes('<&>'));
+  }
+  {
+    // Over the run cap: the busiest customers are summarized, the rest are "not summarized (cap)" in the archive.
+    const { model } = await runStubPipeline({ runCap: 1200 });
+    const capped = model.records.flatMap((r) => r.convs).filter((c) => c.status === 'cap');
+    const { renderArchive } = require('../src/digest/render');
+    const md = renderArchive({ model, window: { start: 0, end: 86400, hours: 24, reason: 'test' }, footer: [], ctx: { workspaceUrl: 'https://ws.example.test', writtenBy: 'm' } });
+    check('caps: a tiny run cap marks calls "not summarized (cap)" with counts instead of aborting',
+      model.stats.notSummarizedCap.calls > 0 && capped.length > 0 && /Not summarized: .*messages; cap/.test(md), JSON.stringify(model.stats.notSummarizedCap));
+  }
+
+  // ---------- Caps: an oversized invented window ----------
   {
     const { planJobs, analyzeAll: runAll } = require('../src/digest/analyze');
-    const { renderDigest: render } = require('../src/digest/render');
     const conv = (id) => ({ id, external: false });
     const msgs = (id, n, chars) => Array.from({ length: n }, (_, k) => ({ conv: conv(id), ts: `${1000 + k}.0`, who: 'Invented Person', text: 'z'.repeat(chars) }));
     // 40 customers of growing size (about 2k to 40k tokens each, about 840k in all), 6 unit sub-groups, and one
@@ -403,39 +559,28 @@ const hang = (init) => new Promise((_, reject) => {
     const keptCustomers = kept.filter((j) => j.kind === 'customer').map((j) => j.messages.length + j.trimmed);
     const skippedCustomers = jobs.filter((j) => j.capSkipped && j.kind === 'customer').map((j) => j.messages.length + j.trimmed);
     check('caps: busiest customers are summarized first; the rest are skipped, not aborted',
-      plan.skippedCalls > 0 && Math.min(...keptCustomers) >= Math.max(...skippedCustomers, 0) && plan.skippedMessages === jobs.filter((j) => j.capSkipped).reduce((t, j) => t + j.messages.length + j.trimmed, 0),
-      JSON.stringify({ skipped: plan.skippedCalls, kept: keptCustomers.length }));
-    check('caps: customers come before unit sub-groups', jobs.filter((j) => j.kind === 'unit').every((j) => j.capSkipped) || jobs.filter((j) => j.kind === 'customer').every((j) => !j.capSkipped));
+      plan.skippedCalls > 0 && Math.min(...keptCustomers) >= Math.max(...skippedCustomers, 0), JSON.stringify({ skipped: plan.skippedCalls, kept: keptCustomers.length }));
+    check('caps: customers come before other calls', jobs.filter((j) => j.kind === 'unit').every((j) => j.capSkipped) || jobs.filter((j) => j.kind === 'customer').every((j) => !j.capSkipped));
     let sent = 0;
-    const stub = async () => { sent++; return { route: 'primary', model: 'm', provider: 'P', json: { went_wrong: [], risks: [], points: [] }, usage: {}, costUsd: 0 }; };
+    const stub = async () => { sent++; return { route: 'primary', model: 'm', provider: 'P', json: { items: [], points: [] }, usage: {}, costUsd: 0 }; };
     const out = await runAll(jobs, { routes: {}, budget: null, maskCounts: newCounts(), concurrency: 3, chatImpl: stub });
     check('caps: skipped calls are never sent', sent === kept.length && out.filter((r) => r.capSkipped).length === plan.skippedCalls, `${sent} sent, ${kept.length} planned`);
-    // The digest names what was not summarized, with counts.
-    const blocks = jobs.filter((j) => j.kind === 'customer').map((j) => ({ conv: { id: j.key, name: j.key.toLowerCase(), type: 'public' }, compressed: { stats: { messagesIn: j.messages.length + j.trimmed } } }));
-    const analysis = new Map(jobs.filter((j) => j.kind === 'customer').map((j) => [j.key, out[jobs.indexOf(j)]]));
-    const md = render({ units: [{ bu: 'Unit B', subs: [{ sub: 'Customers', blocks, quiet: [], errors: [], analysis }] }], window: { start: 0, end: 86400, hours: 24, reason: 'test' }, footer: [],
-      ctx: { workspaceUrl: 'https://ws.example.test', analyzed: true, writtenBy: 'm via P', nameOf: () => '' }, customerKey: { bu: 'Unit B', sub: 'Customers' } });
-    check('caps: the digest lists "Not summarized (cap)" with counts', new RegExp(`Not summarized \\(cap\\): ${skippedCustomers.length} customers, ${skippedCustomers.reduce((a, b) => a + b, 0)} messages`).test(md));
   }
 
-  // ---------- Slack DM delivery (phase 3): send-only client and message (invented IDs and text) ----------
+  // ---------- Slack DM delivery: send-only client (invented IDs and text) ----------
   {
     const { createSender, METHODS } = require('../src/slack-send');
-    const { buildDm, MAX_CHARS } = require('../src/digest/dm');
-    const ME = 'U0INVENTED1';
     const BOT_TOKEN = 'invented-bot-token';
     function fakeSlack({ openReply } = {}) {
       const calls = [];
+      let n = 0;
       const f = async (url, init = {}) => {
         const u = new URL(url);
         calls.push({ host: u.hostname, method: u.pathname.replace('/api/', ''), init });
         const ok = (b) => json(200, { ok: true, ...b });
-        if (u.hostname === 'files.example-upload.slack.com') return json(200, {});
         switch (u.pathname) {
           case '/api/conversations.open': return ok(openReply ?? { channel: { id: 'D0INVENTED', is_im: true, user: ME } });
-          case '/api/chat.postMessage': return ok({ channel: 'D0INVENTED', ts: '1.0' });
-          case '/api/files.getUploadURLExternal': return ok({ upload_url: 'https://files.example-upload.slack.com/upload/v1/abc', file_id: 'F0INVENTED' });
-          case '/api/files.completeUploadExternal': return ok({ files: [{ id: 'F0INVENTED' }] });
+          case '/api/chat.postMessage': return ok({ channel: 'D0INVENTED', ts: `${++n}.0` });
           default: return json(200, { ok: false, error: 'unknown_method' });
         }
       };
@@ -448,18 +593,18 @@ const hang = (init) => new Promise((_, reject) => {
       let early;
       try { await s.postText('x'); } catch (e) { early = e.code; }
       await s.openDm();
-      await s.postText('Invented one-line test.');
-      await s.uploadFile('2026-01-01.md', Buffer.from('invented digest'), 'Slack digest');
-      const api = f.calls.filter((c) => c.host === 'slack.com');
-      const upload = f.calls.find((c) => c.host !== 'slack.com');
+      const top = await s.postText('Invented top line.');
+      await s.postText('Invented thread reply.', top.ts);
+      let badThread;
+      try { await s.postText('x', '999.0'); } catch (e) { badThread = e.code; }
+      const posts = f.calls.filter((c) => c.method === 'chat.postMessage').map((c) => JSON.parse(c.init.body));
       check('deliver: nothing is posted before the DM is verified', early === 'dm-not-verified');
-      check('deliver: open DM, post, get upload URL, upload, complete; into the verified DM only',
-        api.map((c) => c.method).join(',') === 'conversations.open,chat.postMessage,files.getUploadURLExternal,files.completeUploadExternal'
-        && JSON.parse(api[1].init.body).channel === 'D0INVENTED' && JSON.parse(api[3].init.body).channel_id === 'D0INVENTED', api.map((c) => c.method).join(','));
-      check('deliver: bot token only in the Authorization header, never sent to the upload host',
-        api.every((c) => c.init.headers.Authorization === `Bearer ${BOT_TOKEN}` && !String(c.init.body).includes(BOT_TOKEN)) && !JSON.stringify(upload.init.headers).includes(BOT_TOKEN));
-      check('deliver: links are not unfurled', JSON.parse(api[1].init.body).unfurl_links === false);
-      check('deliver: only four write-side methods are known', [...METHODS].sort().join(',') === 'chat.postMessage,conversations.open,files.completeUploadExternal,files.getUploadURLExternal');
+      check('deliver: top message, then one threaded reply under it, into the verified DM only',
+        posts.length === 2 && posts.every((p) => p.channel === 'D0INVENTED') && !('thread_ts' in posts[0]) && posts[1].thread_ts === top.ts, JSON.stringify(posts.map((p) => p.thread_ts ?? null)));
+      check('deliver: replies only under a message this run posted', badThread === 'bad-thread');
+      check('deliver: bot token only in the Authorization header', f.calls.every((c) => c.init.headers.Authorization === `Bearer ${BOT_TOKEN}` && !String(c.init.body).includes(BOT_TOKEN)));
+      check('deliver: links are not unfurled', posts[0].unfurl_links === false && posts[0].unfurl_media === false);
+      check('deliver: only two methods are known (no uploads, no reads)', [...METHODS].sort().join(',') === 'chat.postMessage,conversations.open');
     }
     for (const [label, openReply] of [
       ['a DM with someone else', { channel: { id: 'D0OTHER', is_im: true, user: 'U0SOMEONE' } }],
@@ -476,45 +621,9 @@ const hang = (init) => new Promise((_, reject) => {
       let code;
       try { createSender({ recipient: 'C0CHANNEL', fetchImpl: fakeSlack(), tokenReader: () => BOT_TOKEN }); } catch (e) { code = e.code; }
       check('deliver: a recipient that is not a user ID is refused', code === 'bad-recipient');
-      const f = async (url) => (new URL(url).pathname === '/api/files.getUploadURLExternal'
-        ? json(200, { ok: true, upload_url: 'https://evil.example.test/up', file_id: 'F1' }) : fakeSlack()(url));
-      const s = createSender({ recipient: ME, fetchImpl: f, tokenReader: () => BOT_TOKEN });
-      await s.openDm();
-      let up;
-      try { await s.uploadFile('a.md', Buffer.from('x'), 't'); } catch (e) { up = e.code; }
-      check('deliver: an upload URL off slack.com is refused', up === 'bad-upload-url');
       let tok;
       try { createSender({ recipient: ME, tokenReader: () => { throw new Error('mode'); } }); } catch (e) { tok = e.code; }
       check('deliver: an unreadable or loose bot-token file stops delivery', tok === 'bot-token');
-    }
-    {
-      // The DM: date and model header, customer items first (escaped, code-built links), a line per other unit,
-      // not-summarized counts, and under the length limit even with many items.
-      const refMap = new Map([['m001', { conv: 'C1', ts: '100.000001', threadTs: null }]]);
-      const item = (n, lvl) => ({ summary: `Invented problem ${n} <script> & more ${'x'.repeat(120)}`, severity: lvl, refs: ['m001'] });
-      const analysis = new Map();
-      const blocks = [];
-      for (let i = 0; i < 12; i++) {
-        blocks.push({ conv: { id: `C${i}`, name: `success-${i}`, type: 'public' }, compressed: { stats: { messagesIn: 5 } } });
-        analysis.set(`C${i}`, { ok: true, notable: true, refMap, wentWrong: [item(i, i % 3 ? 'low' : 'high'), item(i + 100, 'medium')], risks: [{ ...item(i + 200, 'x'), likelihood: 'medium' }] });
-      }
-      blocks.push({ conv: { id: 'CQ', name: 'success-capped', type: 'public' }, compressed: { stats: { messagesIn: 9 } } });
-      analysis.set('CQ', { ok: false, capSkipped: true, error: 'not summarized (cap)' });
-      const units = [
-        { bu: 'Unit B', subs: [{ sub: 'Customers', blocks, quiet: [], errors: [], analysis }] },
-        { bu: 'Unit A', subs: [{ sub: 'Ops', blocks: [{ conv: { id: 'C9', name: 'ops' }, compressed: { stats: { messagesIn: 3 } } }], quiet: [], errors: [],
-          analysis: { ok: true, refMap, points: [{ summary: 'Invented ops point', refs: ['m001'] }] } }] },
-      ];
-      const { text, stats } = buildDm({ units, ctx: { workspaceUrl: 'https://ws.example.test', writtenBy: 'm via P', me: null }, customerKey: { bu: 'Unit B', sub: 'Customers' },
-        window: { start: 0, end: 86400, hours: 24 }, counts: { noCloud: { conversations: 2, messages: 7 }, unreadable: 1 } });
-      const links = text.match(/<[^>]+>/g) ?? [];
-      check('dm: under the length limit, with the rest pointed to the file', text.length <= MAX_CHARS && stats.customerItemsShown < stats.customerItems && /…and \d+ more in the file/.test(text), `${text.length} chars`);
-      check('dm: header, customer risks first, other units, then not-summarized counts', /^\*Slack digest, .*\n+Model: m via P/.test(text)
-        && text.indexOf('*Unit B risks*') < text.indexOf('*Other units*') && text.indexOf('*Other units*') < text.indexOf('*Not summarized*')
-        && /Unit A: 1 active conversation: Invented ops point/.test(text) && /2 conversations on the noCloud list \(7 messages\); 1 call over the cap \(9 messages\); 1 conversation unreadable/.test(text));
-      check('dm: most severe items first', text.split('\n').find((l) => l.startsWith('• ')).includes('[high problem]'));
-      check('dm: model text is escaped; the only links are code-built Slack links', !text.includes('<script>') && text.includes('&lt;script&gt; &amp;')
-        && links.length > 0 && links.every((l) => l.startsWith('<https://ws.example.test/archives/C1/p100000001|')));
     }
   }
 

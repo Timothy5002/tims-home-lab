@@ -1,7 +1,7 @@
 'use strict';
 // Evaluates the Slack digest prompts (src/digest/prompts.js) on INVENTED sample days, against each model route
 // separately (no fallback), using the same preparation and validation code as a real run (src/digest/analyze.js).
-// Prints pass/fail per case side by side. Exits non-zero if the primary route fails any case; the secondary's
+// Prints pass/fail per case side by side; a case that only hit a rate limit is tried once more after 30 s. Exits non-zero if the primary route fails any case; the secondary's
 // results are informational. Run after changing a digest prompt: node scripts/digest-eval.js
 // Costs well under a cent per run. No Slack data is used.
 const fs = require('node:fs');
@@ -24,8 +24,13 @@ const fir = conv('success-fir');
 const ops = conv('team-ops');
 const growth = conv('team-growth');
 
-const allText = (r) => [...(r.wentWrong ?? []), ...(r.risks ?? []), ...(r.points ?? [])].map((i) => i.summary).join(' ').toLowerCase();
-const citesAny = (r, refs) => [...(r.wentWrong ?? []), ...(r.risks ?? []), ...(r.points ?? [])].some((i) => i.refs.some((x) => refs.includes(x)));
+const itemsOf = (r) => [...(r.items ?? []), ...(r.points ?? []), ...(r.incident ? [r.incident] : [])];
+const allText = (r) => [r.headline ?? '', ...itemsOf(r).map((i) => i.summary)].join(' ').toLowerCase();
+const citesAny = (r, refs) => itemsOf(r).some((i) => i.refs.some((x) => refs.includes(x)));
+const gamma = conv('success-gamma');
+const lead = conv('leadership');
+const eng = conv('eng');
+const salesA = conv('unit-a-sales');
 
 const CASES = [
   {
@@ -35,7 +40,7 @@ const CASES = [
       msg(acme, 12, 'Riley', 'Looking now, seems the carrier trunk is down.'),
       msg(acme, 95, 'Riley', 'Fixed, trunk restored at 9:35. Root cause was an expired certificate.'),
     ] },
-    expect: (r) => r.notable && (r.wentWrong?.length ?? 0) >= 1 && /call|trunk|carrier|busy|fail|down/.test(allText(r)),
+    expect: (r) => r.notable && r.items.some((i) => i.category === 'incident' && i.severity !== 'low') && /call|trunk|carrier|busy|fail|down/.test(allText(r)),
   },
   {
     name: 'quiet day is not notable',
@@ -44,7 +49,7 @@ const CASES = [
       msg(birch, 20, 'Riley', 'Anytime. Our next check-in is Thursday at 2pm, invite sent.'),
       msg(birch, 25, 'Morgan (Birch)', 'Perfect, see you then.'),
     ] },
-    expect: (r) => !r.notable && (r.wentWrong?.length ?? 0) === 0 && (r.risks?.length ?? 0) === 0,
+    expect: (r) => !r.notable && r.items.length === 0,
   },
   {
     name: 'one real alert among routine bot posts',
@@ -61,7 +66,7 @@ const CASES = [
       msg(delta, 0, 'Casey (Delta)', 'Following up again on the reporting export we asked for two weeks ago.'),
       msg(delta, 240, 'Casey (Delta)', 'This is the third time I am asking. Our board meeting is Friday and we still have nothing.'),
     ] },
-    expect: (r) => r.notable && (r.risks?.length ?? 0) + (r.wentWrong?.length ?? 0) >= 1 && /report|export|follow|ask|friday|board|chas|wait|delay/.test(allText(r)),
+    expect: (r) => r.notable && /report|export|follow|ask|friday|board|chas|wait|delay/.test(allText(r)),
   },
   {
     name: 'sarcasm is not read as praise',
@@ -77,6 +82,68 @@ const CASES = [
       msg(fir, 30, 'Quinn (Fir)', 'Our SMS confirmations stopped sending yesterday afternoon and nobody has responded to my ticket.'),
     ] },
     expect: (r) => r.notable && /sms|confirm|ticket|respon/.test(allText(r)) && !/evil|https?:|example\.test/.test(allText(r)),
+  },
+  {
+    name: 'personnel matter is never reported',
+    job: { kind: 'customer', key: 'gamma1', header: 'Customer: Gamma. Channel #success-gamma.', messages: [
+      msg(gamma, 0, 'Lee', 'Heads up: Jordan on our side was late to the Gamma call again, I am putting him on a performance plan.'),
+      msg(gamma, 10, 'Kim', 'Understood, I will handle the HR side.'),
+    ] },
+    expect: (r) => !/jordan|performance|late|hr|plan/.test(allText(r)),
+  },
+  {
+    name: 'bot hygiene is not a customer item',
+    job: { kind: 'customer', key: 'gamma2', header: 'Customer: Gamma. Channel #success-gamma.', messages: [
+      msg(gamma, 0, 'ReportBot (bot, 3 similar posts)', 'Reminder: EOD report not posted for #success-gamma today.', { bot: true }),
+      msg(gamma, 60, 'SchedBot (bot)', 'Weekly scheduled check-in post for Gamma.', { bot: true }),
+    ] },
+    expect: (r) => r.items.length === 0,
+  },
+  {
+    name: 'bot risk report is evidence, labeled bot report',
+    job: { kind: 'customer', key: 'gamma3', header: 'Customer: Gamma. Channel #success-gamma.', messages: [
+      msg(gamma, 0, 'RiskBot (bot)', 'RISK REPORT: Gamma usage down 40% week over week; renewal date in 30 days; champion left the company.', { bot: true }),
+    ] },
+    expect: (r) => r.items.length >= 1 && r.items.every((i) => i.botReport) && /usage|renewal|champion|40/.test(allText(r)),
+  },
+  {
+    name: 'synthesis merges channels and leadership',
+    job: { kind: 'synth', key: 'acme', customer: { name: 'Acme' }, messages: [
+      msg(acme, 0, 'Jordan (Acme)', 'Inbound calls failing since 8am, customers get a busy tone.'),
+      msg(conv('acme-coordination'), 30, 'Jordan (Acme)', 'Second outage this week. We are reviewing our options before the renewal.'),
+      msg(lead, 120, 'Dana', 'Acme is escalating again. Who owns the Acme account this week?', { mention: 'leadership', where: '#leadership (leadership)' }),
+    ], findings: [
+      { summary: 'Inbound calls failed from 8am.', kind: 'problem', severity: 'high', category: 'incident', refs: ['s001'] },
+      { summary: 'Customer is reviewing options before renewal after a second outage.', kind: 'risk', severity: 'high', category: 'commercial', refs: ['s002'] },
+    ] },
+    expect: (r) => r.notable && r.severity === 'high' && r.headline.split(' ').length <= 20 && r.leadership && /call|outage|renewal|option/.test(allText(r)),
+  },
+  {
+    name: 'brief unit: at most 3 short items',
+    job: { kind: 'brief', key: 'unit-a', header: 'Unit: Unit A. Conversations: #unit-a-sales.', messages: [
+      msg(salesA, 0, 'Lee', 'Signed the Birch renewal for two years.'),
+      msg(salesA, 10, 'Kim', 'Coffee machine is fixed.'),
+      msg(salesA, 20, 'Ari', 'Dashboard login broken since the deploy, rolling back now.'),
+      msg(salesA, 30, 'Lee', 'Lost the Fir deal to a competitor on price.'),
+      msg(salesA, 40, 'Kim', 'Lunch at noon.'),
+    ] },
+    expect: (r) => r.points.length >= 1 && r.points.length <= 3 && r.points.every((p) => p.summary.split(' ').length <= 12) && !/coffee|lunch/.test(allText(r)),
+  },
+  {
+    name: 'incident check: customer-facing outage found',
+    job: { kind: 'incident', key: 'eng', header: 'Unit: Internal. Conversations: #eng.', messages: [
+      msg(eng, 0, 'Ari', 'Outbound calls failing for all customers since 07:50, carrier issue.'),
+      msg(eng, 70, 'Ari', 'Restored at 09:00.'),
+    ] },
+    expect: (r) => Boolean(r.incident) && /call|carrier|outbound|fail/.test(allText(r)),
+  },
+  {
+    name: 'incident check: internal-only problem ignored',
+    job: { kind: 'incident', key: 'eng2', header: 'Unit: Internal. Conversations: #eng.', messages: [
+      msg(eng, 0, 'Lee', 'The internal wiki is slow today.'),
+      msg(eng, 5, 'Ari', 'Our CI pipeline is flaky, re-running.'),
+    ] },
+    expect: (r) => r.incident === null,
   },
   {
     name: 'unit summary cites its sources',
@@ -99,15 +166,22 @@ const CASES = [
   for (const name of names) {
     const budget = createBudget({ maxCostUsd: 0.2 });
     // Each route is called directly: no fallback in an eval.
-    const results = await analyzeAll(CASES.map((c) => c.job), {
-      routes, budget, maskCounts: newCounts(), concurrency: 3,
-      chatImpl: (o) => chat({ ...o, only: name }),
-    });
+    const run = (jobs) => analyzeAll(jobs, { routes, budget, maskCounts: newCounts(), concurrency: 1, chatImpl: (o) => chat({ ...o, only: name }) });
+    const results = await run(CASES.map((c) => c.job));
+    // Cases that only hit a rate limit are tried once more after a pause: the eval measures the prompts, not
+    // the provider's momentary limits. Any other failure stands.
+    const limited = results.map((r, i) => (r.error === 'rate-limited' ? i : -1)).filter((i) => i >= 0);
+    if (limited.length) {
+      await new Promise((r) => setTimeout(r, 30_000));
+      const again = await run(limited.map((i) => CASES[i].job));
+      limited.forEach((i, k) => { results[i] = again[k]; });
+    }
     table[name] = results.map((r, i) => {
       if (!r.ok) return { pass: false, why: r.error };
       const refs = [...r.refMap.keys()];
-      const pass = CASES[i].expect(r, refs) && r.dropped === 0;
-      return { pass, why: pass ? '' : `items ${(r.wentWrong?.length ?? 0) + (r.risks?.length ?? 0) + (r.points?.length ?? 0)}, notable ${r.notable ?? '-'}, dropped ${r.dropped}`, provider: r.provider };
+      // A case also fails if any item was dropped for a missing or invalid reference (noise drops are expected).
+      const pass = CASES[i].expect(r, refs) && r.drops.badRef === 0;
+      return { pass, why: pass ? '' : `items ${itemsOf(r).length}, notable ${r.notable ?? '-'}, dropped ${JSON.stringify(r.drops)}`, provider: r.provider };
     });
     cost[name] = budget.used;
   }

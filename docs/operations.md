@@ -37,6 +37,7 @@ launchctl kickstart -k gui/$(id -u)/com.lab.schedule.slack-digest          # run
 tail -n 60 ~/Library/Logs/lab-dispatcher/schedule-slack-digest.log         # digest stats (never message text)
 node scripts/digest-dm-test.js                                             # send one invented line to your DM; prints stats
 node scripts/digest-selftest.js                                            # digest guard tests (no network)
+node scripts/digest-customers.js                                           # print the customer registry (names only)
 ```
 The digest keeps the newest 14 files in `data/digests/` and deletes older ones; its last success is in `data/digest-state.json`. See [slack-digest.md](slack-digest.md).
 After editing a file in `launchd/`, reinstall it with `scripts/install-agent.sh launchd/<file>.plist`. After editing `src/`, restart the dispatcher with the `kickstart -k` command above.
@@ -53,6 +54,7 @@ After editing a file in `launchd/`, reinstall it with `scripts/install-agent.sh 
 | `disk-check` fails | Free space on the internal drive is under 25% or under 40 GB; the job's output (in `schedule-disk-check.log` and the healthchecks.io ping body) shows the numbers |
 | `disk-check` lists `Library`, `Documents` etc. as unreadable | Expected. Jobs run under launchd's `node`, which macOS privacy does not let into protected folders, and Full Disk Access is deliberately not granted. Free space is still exact; only the folder list is incomplete |
 | Nothing runs after a reboot | Auto-login is off, or the agent isn't installed in `~/Library/LaunchAgents/` |
-| Digest healthcheck is down, log says `delivery-failed` | The digest file was still written. The `delivery.code` in the log is Slack's error code: `missing_scope` (add the scope in the Slack app and reinstall it), `invalid_auth` or `bot-token` (check `~/.lab/slack-bot-token`, mode 600), `dm-mismatch` (Slack returned a DM that is not yours; nothing was posted) |
+| Digest healthcheck is down, log says `delivery-failed` | The digest file was still written, and the last success did not move, so the next run covers the window again. The `delivery.code` in the log is Slack's error code: `missing_scope` (add the scope in the Slack app and reinstall it), `invalid_auth` or `bot-token` (check `~/.lab/slack-bot-token`, mode 600), `dm-mismatch` (Slack returned a DM that is not yours; nothing was posted), `thread-not-posted` (the top message went out but the reply failed) |
+| A customer's channels show up as separate records, or "unmatched channels" grows | Run `node scripts/digest-customers.js`, then add extra `keys`, `aliases` or hand-assigned `channels` (or `notCustomers`) in `config/digest-customers.json` |
 | Digest log says `not summarized (cap)` or the footer counts calls over the cap | The window held more than the 400k-token run cap (for example after several missed days); the busiest customers were summarized and the rest listed with counts |
 | Digest ran but the healthcheck shows `/fail` with `deadline` | The run passed 25 minutes; usually Slack rate limits. No digest was written and the last success did not move |

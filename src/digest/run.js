@@ -1,16 +1,20 @@
 'use strict';
 // Runs the daily Slack digest: fetch every conversation mapped to a business unit for the window, compress bot posts
-// in code, then (phase 2) ask the pinned cloud model for risks per customer and a short summary per sub-group
-// (src/digest/analyze.js), and render data/digests/<date>.md (mode 600). --no-model gives the phase 1 code-only
-// digest. See docs/slack-digest.md.
+// in code, then run the model pipeline (src/digest/pipeline.js): the customer registry merges each customer's
+// channels, stage 1 extracts findings per customer conversation, stage 2 merges them per customer with mentions
+// from Leadership and Internal channels, and units are handled by their mode (full, brief, off). It renders the
+// customer-merged archive file data/digests/<date>.md (mode 600). --no-model gives the code-only digest.
+// See docs/slack-digest.md.
 //
 // Window: since the last recorded successful run, capped at maxWindowHours; with no record, the last
 // defaultWindowHours. Hand runs do not move the record unless --record is given. The record is written atomically,
-// and only after the digest file is written.
+// only after the digest file is written and, when delivering, only after the delivery succeeded, so a failed
+// delivery makes the next run cover the window again.
 //
-// Scheduled runs (--scheduled, from launchd/com.lab.schedule.slack-digest.plist at 06:00): record the success,
-// deliver the digest by Slack DM (src/slack-send.js), and ping ~/.lab/healthcheck-url-slack-digest with stats
-// only: success, or /fail on any error, deadline or failed delivery. They print no per-conversation progress.
+// Scheduled runs (--scheduled, from launchd/com.lab.schedule.slack-digest.plist at 06:00): deliver the digest by
+// Slack DM (src/slack-send.js: a short top-level message and one threaded reply; no file), record the success,
+// and ping ~/.lab/healthcheck-url-slack-digest with stats only: success, or /fail on any error, deadline or failed
+// delivery. They print no per-conversation progress.
 //
 // Retention: message text lives in memory only. The digest file is the only thing written that contains text;
 // the last KEEP_DIGESTS digest files are kept and older ones deleted. stdout, logs, the run row in
@@ -28,10 +32,11 @@ const { parseArgs } = require('node:util');
 const { ROOT, DATA_DIR, CHANNELS_FILE, createClient, loadConfig, placeChannel, localDay } = require('../slack');
 const { fetchConversation } = require('./fetch');
 const { compressBots } = require('./compress');
-const { renderDigest, convLabel } = require('./render');
+const { renderDigest, renderArchive, convLabel } = require('./render');
 const { maskText, maskSecrets, newCounts, MASK_TYPES } = require('../mask');
 const { loadRoutes, createBudget, RETRY_CODES } = require('../openrouter');
-const { analyzeAll, planJobs, isCapped } = require('./analyze');
+const { runPipeline } = require('./pipeline');
+const { loadCustomerConfig, buildRegistry } = require('./customers');
 const { buildDm } = require('./dm');
 const { createSender } = require('../slack-send');
 const { checkPingFile, ping } = require('../healthcheck');
@@ -54,7 +59,9 @@ function loadDigestConfig() {
     defaultWindowHours: num('defaultWindowHours', 24),
     maxRunInputTokens: num('maxRunInputTokens', 400_000),  // whole run, estimated before any call
     maxCallInputTokens: num('maxCallInputTokens', 100_000), // one call; safely under the primary's context
-    deliverTo: c.deliverTo ?? null,                          // the one Slack user ID the DM may go to
+    deliverTo: c.deliverTo ?? null,                          // the one Slack user ID the DM may go to (and "me")
+    // Per unit or "Unit > Sub-group": full, brief or off (see src/digest/pipeline.js). Unlisted units are brief.
+    unitModes: c.unitModes && typeof c.unitModes === 'object' ? c.unitModes : {},
     runDeadlineMinutes: num('runDeadlineMinutes', 25),
     unitOrder: Array.isArray(c.unitOrder) ? c.unitOrder : [],
     customerGroup: c.customerGroup ?? null, // { bu, sub }: shown first, quiet ones named
@@ -124,7 +131,7 @@ function readState() {
     const body = JSON.stringify({
       status: summary.status, ...pick('error'), ...pick('windowHours'), servedBy: summary.servedBy,
       ...pick('fallbacks'), ...pick('fallbackReasons'), ...pick('retries'), ...pick('retryReasons'),
-      ...pick('conversationsSummarized'), ...pick('itemsKept'), ...pick('itemsDropped'), ...pick('notSummarizedCap'),
+      ...pick('customersMerged'), ...pick('customersNotable'), ...pick('itemsKept'), ...pick('itemsDropped'), ...pick('itemsDroppedBy'), ...pick('notSummarizedCap'),
       ...pick('costUsd'), runtimeS: summary.runtimeS, delivery: summary.delivery ?? { status: 'not attempted' },
     });
     try {
@@ -270,71 +277,44 @@ function readState() {
       };
     });
 
-    // Phase 2: one call per active customer, one per other active sub-group. noCloud conversations are never sent.
+    // The model pipeline (src/digest/pipeline.js): customer registry, stage-1 extraction per customer conversation,
+    // unit modes, mentions, stage-2 synthesis per customer. noCloud conversations are never sent.
+    let model = null;
     let modelLines = [];
+    let dmFooter = [];
     if (useModel) {
       const routes = loadRoutes(cfg.models);
-      const toMessages = (b, where) => [
-        ...b.compressed.humans.map((m) => ({ ts: m.ts, threadTs: m.threadTs, who: ctx.nameOf(m.user), text: m.text })),
-        ...b.compressed.botGroups.flatMap((g) => [...g.examples, ...g.alerts].map((m) => ({
-          ts: m.ts, threadTs: m.threadTs, who: `${g.botName ?? 'bot'} (bot${g.count > 1 ? `, ${g.count} similar posts` : ''})`, text: m.text,
-        }))),
-      ].map((m) => ({ ...m, conv: { id: b.conv.id, external: b.conv.external }, where }));
-      const jobs = [];
-      for (const u of units) {
-        for (const sub of u.subs) {
-          const sendable = sub.blocks.filter((b) => !b.conv.noCloud);
-          if (!sendable.length) continue;
-          if (cg && u.bu === cg.bu && sub.sub === cg.sub) {
-            for (const b of sendable) {
-              jobs.push({ kind: 'customer', key: b.conv.id, sub, header: `Customer channel: ${convLabel(b.conv, cfg.myName)}.`,
-                messages: toMessages(b, null).sort((x, y) => Number(x.ts) - Number(y.ts)) });
-            }
-          } else {
-            const msgs = sendable.flatMap((b) => toMessages(b, convLabel(b.conv, cfg.myName))).sort((x, y) => Number(x.ts) - Number(y.ts));
-            jobs.push({ kind: 'unit', key: `${u.bu} > ${sub.sub ?? '-'}`, sub,
-              header: `Unit: ${u.bu}. Sub-group: ${sub.sub ?? '(none)'}. Conversations: ${sendable.map((b) => convLabel(b.conv, cfg.myName)).join(', ')}.`, messages: msgs });
-          }
-        }
-      }
-      // Whole-run plan before any call: customers first, then sub-groups, busiest first; what does not fit the run
-      // cap is marked "not summarized (cap)" and a call over the per-call cap keeps its newest messages.
-      const plan = planJobs(jobs, { runCap: cfg.maxRunInputTokens, callCap: cfg.maxCallInputTokens });
-      summary.estimatedInputTokens = plan.estimatedInputTokens;
-      summary.notSummarizedCap = { calls: plan.skippedCalls, messages: plan.skippedMessages, trimmedCalls: plan.trimmedCalls, trimmedMessages: plan.trimmedMessages };
+      for (const c of targets) c.label = convLabel(c, cfg.myName);
+      const registry = buildRegistry(targets, loadCustomerConfig());
       const budget = createBudget({ maxInputTokens: cfg.maxRunInputTokens, maxOutputTokens: cfg.maxOutputTokens, maxCostUsd: cfg.maxRunCostUsd });
       let done = 0;
-      const results = await analyzeAll(jobs, {
-        routes, budget, maskCounts, reasoning: opts.reasoning,
-        onDone: (r) => progress(`  model [${++done}/${jobs.length}] ${r.kind} ${r.ok ? 'ok' : r.error}${r.retried ? ' (retried)' : ''}${r.fellBack ? ' (secondary)' : ''}\n`),
+      model = await runPipeline({
+        blocks, registry, modes: cfg.unitModes, me: cfg.deliverTo, nameOf: ctx.nameOf, routes, budget, maskCounts,
+        runCap: cfg.maxRunInputTokens, callCap: cfg.maxCallInputTokens, reasoning: opts.reasoning,
+        onDone: (r) => progress(`  model [${++done}] ${r.kind} ${r.ok ? 'ok' : r.error}${r.retried ? ' (retried)' : ''}${r.fellBack ? ' (secondary)' : ''}\n`),
       });
-      // Calls stopped mid-run by a run cap count as not summarized (cap) too.
-      const lateCapped = results.filter((r) => isCapped(r) && !r.capSkipped);
-      summary.notSummarizedCap.calls += lateCapped.length;
-      summary.notSummarizedCap.messages += lateCapped.reduce((t, r) => t + r.messages, 0);
-      for (const [i, j] of jobs.entries()) {
-        if (j.kind === 'customer') (j.sub.analysis ??= new Map()).set(j.key, results[i]);
-        else j.sub.analysis = results[i];
-      }
+      const results = model.results;
       // Which model and provider served, per call; no text.
       const served = {};
       for (const r of results) if (r.provider) served[`${r.model} via ${r.provider}`] = (served[`${r.model} via ${r.provider}`] ?? 0) + 1;
       const ok = results.filter((r) => r.ok);
-      const kept = ok.reduce((t, r) => t + (r.wentWrong?.length ?? 0) + (r.risks?.length ?? 0) + (r.points?.length ?? 0), 0);
-      const dropped = ok.reduce((t, r) => t + r.dropped, 0);
       const fellBack = results.filter((r) => r.fellBack).length;
       // Why the primary was retried or given up on (error codes only), so frequent retries and fallbacks are visible.
       const retriedCalls = results.filter((r) => RETRY_CODES.has(r.primaryErrors?.[0]));
       const retryReasons = tally(retriedCalls.map((r) => r.primaryErrors[0]));
       const fallbackReasons = tally(results.filter((r) => r.fellBack).map((r) => r.primaryErrors?.at(-1) ?? r.primaryError ?? 'unknown'));
       const recoveredByRetry = results.filter((r) => r.ok && r.retried && !r.fellBack).length;
-      const convsSummarized = jobs.reduce((t, j, idx) => t + (results[idx].ok ? new Set(j.messages.map((m) => m.conv.id)).size : 0), 0);
+      const st = model.stats;
+      const droppedTotal = Object.values(st.itemsDropped).reduce((a, b) => a + b, 0);
       Object.assign(summary, {
-        modelCalls: results.length, callsOk: ok.length, callsFailed: results.length - ok.length,
-        failures: Object.fromEntries([...new Set(results.filter((r) => !r.ok).map((r) => r.error))].map((e) => [e, results.filter((r) => r.error === e).length])),
-        conversationsSummarized: convsSummarized, customersNotable: ok.filter((r) => r.kind === 'customer' && r.notable).length,
-        itemsKept: kept, itemsDropped: dropped, retries: retriedCalls.length, retryReasons, recoveredByRetry,
-        fallbacks: fellBack, fallbackReasons, servedBy: served,
+        modelCalls: results.length, calls: st.calls, callsOk: ok.length, callsFailed: results.length - ok.length,
+        failures: tally(results.filter((r) => !r.ok).map((r) => r.error)),
+        customersWithActivity: st.customersWithActivity, customersMerged: st.customersMerged, customersNotable: st.customersNotable,
+        customersNotMerged: st.customersFallback, unmatchedChannels: registry.unmatched.length, mentionMessages: st.mentionMessages,
+        itemsKept: st.itemsKept, itemsDropped: droppedTotal, itemsDroppedBy: st.itemsDropped, incidents: model.incidents.length,
+        skipped: { botHygiene: model.skipped.botHygiene, botPosts: model.skipped.botPosts, quietConversations: model.skipped.quietConversations, ownConversations: model.skipped.ownConversations },
+        notSummarizedCap: st.notSummarizedCap, estimatedInputTokens: model.plan.estimatedInputTokens,
+        retries: retriedCalls.length, retryReasons, recoveredByRetry, fallbacks: fellBack, fallbackReasons, servedBy: served,
         tokens: { input: budget.used.inputTokens, output: budget.used.outputTokens, reasoning: budget.used.reasoningTokens },
         costUsd: Number(budget.used.costUsd.toFixed(6)), costCapUsd: cfg.maxRunCostUsd,
       });
@@ -344,14 +324,23 @@ function readState() {
         : names.length === 1 && !fellBack ? names[0][0]
           : names.map(([n, c]) => `${n} (${c} ${c === 1 ? 'call' : 'calls'})`).join('; ') + (fellBack ? `; ${fellBack} fell back to the secondary` : '');
       const fmt = (o) => Object.entries(o).map(([k, v]) => `${k} ${v}`).join(', ');
-      const nsc = summary.notSummarizedCap;
+      const nsc = st.notSummarizedCap;
       modelLines = [
-        `- Model: ${ctx.writtenBy}. Calls ${results.length} (${ok.length} ok${results.length - ok.length ? `, ${results.length - ok.length} not ok` : ''}).`,
+        `- Model: ${ctx.writtenBy}. Calls ${results.length} (${st.calls.stage1} stage 1, ${st.calls.synthesis} synthesis; ${ok.length} ok${results.length - ok.length ? `, ${results.length - ok.length} not ok` : ''}).`,
         `- Primary retries: ${retriedCalls.length}${retriedCalls.length ? ` (${fmt(retryReasons)}; ${recoveredByRetry} recovered on the retry)` : ''}. Fallbacks to the secondary: ${fellBack}${fellBack ? ` (${fmt(fallbackReasons)})` : ''}.`,
-        `- Not summarized (cap): ${nsc.calls} ${nsc.calls === 1 ? 'call' : 'calls'}, ${nsc.messages} messages; trimmed to the per-call cap: ${nsc.trimmedCalls} ${nsc.trimmedCalls === 1 ? 'call' : 'calls'}, ${nsc.trimmedMessages} oldest messages left out. Run cap ${cfg.maxRunInputTokens.toLocaleString('en-US')} tokens (planned ${plan.estimatedInputTokens.toLocaleString('en-US')}), per-call cap ${cfg.maxCallInputTokens.toLocaleString('en-US')}.`,
-        `- Items kept ${kept}, dropped for missing or invalid references ${dropped}.`,
+        `- Customers: ${st.customersWithActivity} with activity or mentions, ${st.customersMerged} merged, ${st.customersNotable} notable${st.customersFallback ? ` (${st.customersFallback} not merged: stage-1 findings shown)` : ''}; ${registry.unmatched.length} channels matched no customer; ${st.mentionMessages} mention messages.`,
+        `- Not summarized (cap): ${nsc.calls} ${nsc.calls === 1 ? 'call' : 'calls'}, ${nsc.messages} messages; trimmed to the per-call cap: ${nsc.trimmedCalls} ${nsc.trimmedCalls === 1 ? 'call' : 'calls'}, ${nsc.trimmedMessages} oldest messages left out. Run cap ${cfg.maxRunInputTokens.toLocaleString('en-US')} tokens (stage 1 planned ${model.plan.estimatedInputTokens.toLocaleString('en-US')}), per-call cap ${cfg.maxCallInputTokens.toLocaleString('en-US')}.`,
+        `- Items kept ${st.itemsKept}; dropped ${droppedTotal} (${fmt(st.itemsDropped)}).`,
         `- Tokens: input ${budget.used.inputTokens.toLocaleString('en-US')}, output ${budget.used.outputTokens.toLocaleString('en-US')} (reasoning ${budget.used.reasoningTokens}). Cost $${budget.used.costUsd.toFixed(4)} of a $${cfg.maxRunCostUsd} cap.`,
         `- Masked before sending (secrets in every conversation, the rest in external ones): ${MASK_TYPES.map((t) => `${t} ${maskCounts[t]}`).join(', ')}.`,
+      ];
+      // The DM thread's footer: model, provider, retries, fallbacks and cost. Stats only.
+      dmFooter = [
+        `Model: ${ctx.writtenBy}`,
+        `${results.length} calls, ${retriedCalls.length} retried, ${fellBack} fell back${fellBack ? ` (${fmt(fallbackReasons)})` : ''}`,
+        `$${budget.used.costUsd.toFixed(4)}`,
+        `window ${window.hours.toFixed(1)} h`,
+        ...(registry.unmatched.length ? [`${registry.unmatched.length} unmatched channels`] : []),
       ];
     }
 
@@ -373,35 +362,37 @@ function readState() {
       `- Not sent to any model by choice (noCloud): ${totals.noCloudConversations} active ${totals.noCloudConversations === 1 ? 'conversation' : 'conversations'}.`,
       `- Slack API calls: ${s.calls}, rate-limit waits: ${s.rateLimited}. Runtime: ${Math.round((Date.now() - started) / 1000)} s.`,
     ];
-    const text = renderDigest({ units, window, footer, ctx, customerKey: cg });
+    const text = useModel ? renderArchive({ model, window, footer, ctx }) : renderDigest({ units, window, footer, ctx, customerKey: cg });
     const file = path.join(DIGEST_DIR, `${localDay(new Date(now * 1000))}.md`);
     writePrivateText(file, text);
     summary.digestFile = path.relative(ROOT, file);
-    // The success is recorded only now that the digest file exists (atomic write: temp file, then rename).
-    if (record) writePrivateText(STATE_FILE, `${JSON.stringify({ lastSuccessAt: new Date(now * 1000).toISOString() })}\n`);
     summary.digestsDeleted = pruneDigests();
 
-    // Delivery: scheduled runs, or --deliver. A failure leaves the digest file in place and fails the run.
-    if (opts.scheduled || opts.deliver) {
+    // Delivery: scheduled runs, or --deliver. A failure keeps the digest file, fails the run, and does not move the
+    // last-success record, so the next run covers this window again.
+    const delivering = opts.scheduled || opts.deliver;
+    if (delivering) {
       summary.delivery = { status: 'failed' };
       try {
+        if (!useModel) throw Object.assign(new Error('delivery needs the model digest'), { code: 'no-model' });
         if (!cfg.deliverTo) throw Object.assign(new Error('no deliverTo in config/slack-digest.json'), { code: 'no-recipient' });
-        const dm = buildDm({ units, ctx, customerKey: cg, window, counts: {
-          noCloud: { conversations: totals.noCloudConversations, messages: blocks.filter((b) => b.conv.noCloud && b.compressed).reduce((t, b) => t + b.compressed.stats.messagesIn, 0) },
-          unreadable: totals.errors,
-        } });
+        const dm = buildDm({ model, window, ctx, footer: dmFooter });
         const sender = createSender({ recipient: cfg.deliverTo });
         await sender.openDm();
-        await sender.postText(dm.text);
-        const bytes = Buffer.from(text, 'utf8');
-        await sender.uploadFile(path.basename(file), bytes, `Slack digest ${path.basename(file, '.md')}`);
-        summary.delivery = { status: 'ok', messageChars: dm.stats.chars, customerItems: dm.stats.customerItems, customerItemsShown: dm.stats.customerItemsShown, fileBytes: bytes.length, slackCalls: sender.stats.calls };
+        const posted = await sender.postText(dm.top);
+        summary.delivery = { status: 'failed', code: 'thread-not-posted', topChars: dm.stats.topChars };
+        await sender.postText(dm.thread, posted.ts);
+        summary.delivery = { status: 'ok', ...dm.stats, slackCalls: sender.stats.calls };
       } catch (e) {
-        summary.delivery = { status: 'failed', code: e.code ?? 'error' };
+        summary.delivery = { ...summary.delivery, status: 'failed', code: e.code ?? 'error' };
       }
     }
+    const delivered = !delivering || summary.delivery.status === 'ok';
+    // The success is recorded only after the digest file exists and, when delivering, after delivery succeeded
+    // (atomic write: temp file, then rename).
+    if (record && delivered) writePrivateText(STATE_FILE, `${JSON.stringify({ lastSuccessAt: new Date(now * 1000).toISOString() })}\n`);
+    summary.recorded = record && delivered;
     clearTimeout(deadline);
-    const delivered = !summary.delivery || summary.delivery.status === 'ok';
     finish(delivered ? 'ok' : 'delivery-failed', delivered ? 0 : 1);
     // Counts only on stdout; the digest itself is not printed.
     console.log(`Digest written to ${summary.digestFile} (mode 600).`);

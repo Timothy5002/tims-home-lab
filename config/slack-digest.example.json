@@ -4,7 +4,8 @@
   "threadLookbackDays": 14,
   "maxWindowHours": 72,
   "defaultWindowHours": 24,
-  "maxInputTokens": 122000,
+  "maxRunInputTokens": 400000,
+  "maxCallInputTokens": 100000,
   "runDeadlineMinutes": 25,
   "unitOrder": [
     "Unit B",
@@ -15,7 +16,16 @@
     "sub": "Customers"
   },
   "myName": "Your display name",
-  "_keys": "workspaceUrl: for message links. threadLookbackDays: how far back to look for threads with new replies. maxWindowHours/defaultWindowHours: window cap and first-run window. maxInputTokens: per-run cap. runDeadlineMinutes: the run gives up after this. unitOrder: unit order in the digest. customerGroup: the unit > sub-group whose conversations are customers (shown first, quiet ones named). myName: left out of group DM labels.",
+  "deliverTo": "U0000000000",
+  "unitModes": {
+    "Unit B > Success": "full",
+    "Unit B > Customer channels": "full",
+    "Unit B > Leadership": "full",
+    "Unit B > Internal": "off",
+    "Unit A": "brief",
+    "Internal": "off"
+  },
+  "_keys": "workspaceUrl: for message links. threadLookbackDays: how far back to look for threads with new replies. maxWindowHours/defaultWindowHours: window cap and first-run window. maxRunInputTokens: estimated input tokens for the whole run; the busiest calls go first and the rest are marked \"not summarized (cap)\". maxCallInputTokens: estimated input for one call (kept well under the primary model's 163,840-token context; longer calls keep their newest messages). deliverTo: the one Slack user ID the morning DM may go to (yours). runDeadlineMinutes: the run gives up after this. unitOrder: unit order in the digest. customerGroup: the unit > sub-group whose conversations are customers (shown first, quiet ones named). myName: left out of group DM labels.",
   "models": {
     "primary": {
       "model": "deepseek/deepseek-v3.2",
@@ -51,5 +61,6 @@
   "maxRunCostUsd": 0.5,
   "maxOutputTokens": 60000,
   "noCloud": [],
-  "_models": "primary is tried first; secondary once, only on timeout, 5xx, 429 or a provider mismatch. providers are OpenRouter provider slugs, pinned with no fallbacks and data_collection deny. temperature: whether the pinned endpoint accepts it. reasoningMandatory: the model cannot turn reasoning off (reasoningOff is then its lowest level). reasoningAllowance: extra max_tokens for reasoning. noCloud: conversation IDs never sent to any model."
+  "_models": "primary is tried first and retried once after about 3 s on a timeout, 5xx or 429; then the secondary once, only on timeout, 5xx, 429 or a provider mismatch. providers are OpenRouter provider slugs, pinned with no fallbacks and data_collection deny. temperature: whether the pinned endpoint accepts it. reasoningMandatory: the model cannot turn reasoning off (reasoningOff is then its lowest level). reasoningAllowance: extra max_tokens for reasoning. noCloud: conversation IDs never sent to any model.",
+  "_unitModes": "unitModes: \"Unit\" or \"Unit > Sub-group\" -> full (customer conversations become customer records; other sub-groups get a summary in the archive file), brief (at most 3 one-line items per unit, shown in the DM), or off (only an outage or incident that affects customers). Unlisted units are brief. deliverTo is also how your own conversations are recognized (left out of unit summaries when you wrote most of the messages)."
 }

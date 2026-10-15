@@ -1,0 +1,21 @@
+{
+  "_comment": "Example only. Copy to config/digest-customers.json (git-ignored) and edit. Review the result with: node scripts/digest-customers.js. See docs/slack-digest.md.",
+  "customerSources": ["Unit B > Success", "Unit B > Customer channels"],
+  "anchorSources": ["Unit B > Success"],
+  "mentionSources": [
+    { "unit": "Unit B > Leadership", "leadership": true },
+    { "unit": "Unit B > Internal" }
+  ],
+  "stripPrefixes": ["success-", "partner-and-"],
+  "stripSuffixes": ["-ourco-coordination", "-coordination", "-external"],
+  "dropWords": ["ourco", "and", "coordination", "external", "ext"],
+  "minContainLength": 5,
+  "minAliasLength": 4,
+  "customers": {
+    "acmecorp": { "name": "Acme Corp", "keys": ["acme"], "aliases": ["Acme"] },
+    "birchhealth": { "aliases": ["Birch Health", "Birch"], "channels": ["birch-onboarding"] }
+  },
+  "notCustomers": ["partner-and-ourco", "partner-updates"],
+  "noMention": ["general"],
+  "_keys": "customerSources: unit > sub-groups whose conversations belong to customers. anchorSources: where each conversation defines a customer (the success channels). mentionSources: scanned for customer mentions; leadership: true sets the Leadership flag. stripPrefixes/stripSuffixes/dropWords: how a channel name becomes a key. minContainLength: a key joins a customer when one contains the other and the shorter is at least this long. minAliasLength: shorter automatic aliases are not used for mentions. customers: names, extra keys (spelling or hyphenation differences), aliases for mentions, and channels assigned by hand. notCustomers: general channels in the customer sources. noMention: automatic aliases never used for mentions."
+}

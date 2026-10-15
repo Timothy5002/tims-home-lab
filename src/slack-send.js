@@ -4,15 +4,15 @@
 // goes in the Authorization header.
 //
 // It can do exactly one thing: open the DM between the bot and ONE configured user, check that the DM belongs to
-// that user, then post a message and upload a file into that DM. Every other method, channel or upload host is
-// refused in code. It never reads conversations, never listens to events, never replies to anyone, and never
-// logs message text, file contents or the token. Scopes it needs: chat:write, im:write, files:write.
+// that user, then post a message into that DM and one threaded reply under it. Every other method or channel is
+// refused in code. It never reads conversations, never uploads files, never listens to events, never replies to
+// anyone else, and never logs message text or the token. Scopes it needs: chat:write, im:write.
 const { readSecret } = require('./secrets');
 
 const API = 'https://slack.com/api';
 // The only methods this client may call. conversations.open (im:write) opens the bot's DM with the recipient;
-// the others post into that DM.
-const METHODS = new Set(['conversations.open', 'chat.postMessage', 'files.getUploadURLExternal', 'files.completeUploadExternal']);
+// chat.postMessage (chat:write) posts into it.
+const METHODS = new Set(['conversations.open', 'chat.postMessage']);
 const USER_ID = /^[UW][A-Z0-9]{6,}$/;
 
 class DeliveryError extends Error {
@@ -68,37 +68,19 @@ function createSender({ recipient, fetchImpl = fetch, tokenReader = () => readSe
 
   const requireDm = () => { if (!dm) throw new DeliveryError('dm-not-verified', 'open and verify the DM first'); return dm; };
 
-  // Posts text into the verified DM. There is no channel argument: the DM is the only possible target.
-  async function postText(text) {
+  // Posts text into the verified DM; with threadTs, as a reply under one of this client's own messages there. There
+  // is no channel argument: the DM is the only possible target.
+  const posted = new Set();
+  async function postText(text, threadTs = null) {
     const channel = requireDm();
-    const body = await call('chat.postMessage', { channel, text, unfurl_links: false, unfurl_media: false }, { json: true });
+    if (threadTs && !posted.has(threadTs)) throw new DeliveryError('bad-thread', 'replies go only under a message this run posted');
+    const body = await call('chat.postMessage', { channel, text, unfurl_links: false, unfurl_media: false, ...(threadTs ? { thread_ts: threadTs } : {}) }, { json: true });
     if (body.channel !== channel) throw new DeliveryError('dm-mismatch', 'chat.postMessage answered for another channel');
+    posted.add(body.ts);
     return { ts: body.ts };
   }
 
-  // Uploads a file into the verified DM: get an upload URL, send the bytes there, then share it into the DM.
-  async function uploadFile(filename, bytes, title) {
-    const channel = requireDm();
-    const got = await call('files.getUploadURLExternal', { filename, length: String(bytes.length) });
-    let host;
-    try { host = new URL(got.upload_url); } catch { throw new DeliveryError('bad-upload-url', 'upload URL is not a URL'); }
-    // The bytes go only to Slack's own upload host, and the token is not sent there.
-    if (host.protocol !== 'https:' || !/(^|\.)slack\.com$/.test(host.hostname)) throw new DeliveryError('bad-upload-url', 'upload URL is not on slack.com');
-    let res;
-    try {
-      res = await fetchImpl(host.toString(), {
-        method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: bytes, signal: AbortSignal.timeout(60_000),
-      });
-    } catch (e) {
-      throw new DeliveryError('network', `upload: network error (${e.cause?.code ?? e.name})`);
-    }
-    if (!res.ok) throw new DeliveryError(`upload-http-${res.status}`, `upload: HTTP ${res.status}`);
-    stats.calls++;
-    await call('files.completeUploadExternal', { files: [{ id: got.file_id, title }], channel_id: channel }, { json: true });
-    return { fileId: got.file_id };
-  }
-
-  return { openDm, postText, uploadFile, stats, get dm() { return dm; } };
+  return { openDm, postText, stats, get dm() { return dm; } };
 }
 
 // Slack mrkdwn: &, < and > must be escaped in any text that is not a link we built.

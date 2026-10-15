@@ -265,13 +265,14 @@ async function chat(opts) {
     key: (o.keyReader ?? (() => readSecret('openrouter-key')))(),
   };
   const { primary, secondary } = o.routes;
-  if (o.only) return attempt(o.only === 'secondary' ? secondary : primary, o, ctx);
+  // only: one route, no fallback (scripts/model-check.js and the eval); it still gets the one transient retry.
+  const first = o.only === 'secondary' ? secondary : primary;
   // primaryErrors: the error code of every failed primary attempt, in order (codes only, for stats and the footer).
   const primaryErrors = [];
   let lastError;
   for (let tryNo = 1; tryNo <= 2; tryNo++) {
     try {
-      const r = await attempt(primary, o, ctx);
+      const r = await attempt(first, o, ctx);
       return { ...r, fellBack: false, retried: tryNo > 1, primaryErrors };
     } catch (e) {
       primaryErrors.push(e.code);
@@ -280,7 +281,7 @@ async function chat(opts) {
       await ctx.sleepImpl(Math.min(e.retryAfterMs ?? RETRY_DELAY_MS, RETRY_MAX_MS));
     }
   }
-  if (!FALLBACK_CODES.has(lastError.code) || !secondary) {
+  if (o.only || !FALLBACK_CODES.has(lastError.code) || !secondary) {
     lastError.primaryErrors = primaryErrors;
     throw lastError;
   }

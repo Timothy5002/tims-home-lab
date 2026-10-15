@@ -1,95 +1,96 @@
 'use strict';
-// Builds the short Slack DM that announces each morning's digest (the full digest file is uploaded after it).
-// Order: the date and the model header; the customer group's risks (each customer with problems or risks, one
-// line per item with its link); one short line per other unit; then counts of what was not summarized. It stays
-// under MAX_CHARS by dropping the lowest items and saying how many more are in the file.
+// Builds the morning Slack DM from the pipeline's records (src/digest/pipeline.js): a short top-level message and
+// one threaded reply. Slack mrkdwn; model text arrives sanitized and is escaped here; every link is built in code.
 //
-// Only validated, sanitized model items are used (src/digest/analyze.js), escaped for Slack, and every link is
-// built in code from the reference map. The text is returned to the caller for sending; it is never logged.
+// Top-level (hard cap TOP_MAX characters), in this order:
+//   1. title line with the date
+//   2. "Needs attention": at most 5 customers, ranked; bold name, 🔴 high or 🟠 medium, the headline, one link
+//   3. "Watch": the other customers with medium or high items, each name plus at most 6 words
+//   4. "Incident": one line if an outage or incident happened
+//   5. "Other units": one line per brief-mode unit
+//   6. "Skipped": counts of bot noise and quiet channels
+// Thread reply (cap THREAD_MAX): per-customer bullets with links (medium and high only), the brief units' items
+// with links, other incidents, and the footer (model, provider, retries, fallbacks, cost).
+// Low-severity items never appear here; they stay in the archive file. If the top-level would run long, it is
+// shortened in steps (Watch descriptions, unit items, then fewer "Needs attention" lines moving to Watch).
 const { permalink } = require('../slack');
-const { escapeMrkdwn } = require('../slack-send');
-const { convLabel, LEVEL_ORDER } = require('./render');
-const { isCapped } = require('./analyze');
+const { escapeMrkdwn: esc } = require('../slack-send');
 
-const MAX_CHARS = 2900;
-const UNIT_LINE_CHARS = 160;
+const TOP_MAX = 1500;
+const THREAD_MAX = 3900;
+const ICON = { high: '🔴', medium: '🟠' };
 
-const cut = (s, n) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
+const cutWords = (s, n) => { const w = String(s).split(' ').filter(Boolean); return w.length > n ? `${w.slice(0, n).join(' ')}…` : w.join(' '); };
+const link = (e, ctx, label = '›') => (e ? `<${permalink(ctx.workspaceUrl, e.conv, e.ts, e.threadTs)}|${label}>` : '');
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
-function link(ref, refMap, ctx) {
-  const m = refMap.get(ref);
-  return m ? ` <${permalink(ctx.workspaceUrl, m.conv, m.ts, m.threadTs)}|link>` : '';
-}
 
-// units, ctx, customerKey and window as passed to renderDigest; counts: { noCloud: { conversations, messages },
-// unreadable } from the run.
-function buildDm({ units, ctx, customerKey, window, counts }) {
-  const day = new Date(window.end * 1000).toLocaleString('en-GB', { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
-  const head = [`*Slack digest, ${escapeMrkdwn(day)}* (${window.hours.toFixed(1)} h)`, `Model: ${escapeMrkdwn(ctx.writtenBy ?? 'code only (no model)')}`];
+// model: runPipeline() result; window; ctx: { workspaceUrl, writtenBy }; footer: [string] (stats only).
+function buildDm({ model, window, ctx, footer }) {
+  const day = new Date(window.end * 1000).toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' });
+  const shown = model.records.filter((r) => r.notable && (r.severity === 'high' || r.severity === 'medium'));
+  const briefUnits = model.units.filter((u) => u.kind === 'brief' && u.status === 'ok');
+  const s = model.skipped;
 
-  // Customer items, most severe first, one line each.
-  const items = [];
-  let customersWithItems = 0;
-  const capped = { calls: 0, messages: 0 };
-  let failed = 0;
-  const unitLines = [];
-  for (const u of units) {
-    let active = 0;
-    let points = [];
-    let unitCapped = 0;
-    for (const s of u.subs) {
-      const isCustomers = customerKey && u.bu === customerKey.bu && s.sub === customerKey.sub;
-      if (isCustomers) {
-        for (const b of s.blocks) {
-          if (b.conv.noCloud) continue;
-          const r = s.analysis?.get(b.conv.id);
-          if (isCapped(r)) { capped.calls++; capped.messages += b.compressed.stats.messagesIn; continue; }
-          if (!r?.ok) { failed++; continue; }
-          if (!r.notable) continue;
-          customersWithItems++;
-          for (const i of [...r.wentWrong.map((x) => ({ ...x, level: x.severity, kind: 'problem' })), ...r.risks.map((x) => ({ ...x, level: x.likelihood, kind: 'risk' }))]) {
-            items.push({ order: LEVEL_ORDER[i.level] ?? 1, line: `• ${escapeMrkdwn(convLabel(b.conv, ctx.me))}: [${i.level} ${i.kind}] ${escapeMrkdwn(i.summary)}${link(i.refs[0], r.refMap, ctx)}` });
-          }
-        }
-        continue;
-      }
-      const sent = s.blocks.filter((b) => !b.conv.noCloud);
-      active += s.blocks.length;
-      if (!sent.length) continue;
-      const r = s.analysis;
-      if (isCapped(r)) { capped.calls++; capped.messages += sent.reduce((t, b) => t + b.compressed.stats.messagesIn, 0); unitCapped++; continue; }
-      if (!r?.ok) { failed++; continue; }
-      points = points.concat(r.points.map((p) => ({ p, refMap: r.refMap })));
+  function top({ attention, watchWords, unitItems, headlineWords }) {
+    const lines = [`*Slack digest · ${esc(day)}*`];
+    const need = shown.slice(0, attention);
+    const watch = shown.slice(attention);
+    lines.push('', '*Needs attention*');
+    if (need.length) for (const r of need) lines.push(`• *${esc(r.name)}* ${ICON[r.severity]} ${esc(cutWords(r.headline, headlineWords))} ${link(r.best, ctx)}`);
+    else lines.push('Nothing urgent.');
+    if (watch.length) lines.push('', `*Watch*: ${watch.map((r) => (watchWords ? `${esc(r.name)} (${esc(cutWords(r.headline, watchWords))})` : esc(r.name))).join(', ')}`);
+    const inc = model.incidents[0];
+    if (inc) lines.push('', `*Incident*: ${esc(inc.source)}: ${esc(cutWords(inc.summary, 20))} ${link(inc.evidence[0], ctx)}${model.incidents.length > 1 ? ` (+${model.incidents.length - 1} in thread)` : ''}`);
+    if (briefUnits.length) {
+      lines.push('', '*Other units*');
+      for (const u of briefUnits) lines.push(`• ${esc(u.bu)}: ${u.points.length ? u.points.slice(0, unitItems).map((p) => esc(p.summary)).join('; ') : 'nothing notable'}`);
     }
-    if (!active) continue;
-    const top = points[0];
-    const tail = top ? `: ${escapeMrkdwn(cut(top.p.summary, UNIT_LINE_CHARS))}${link(top.p.refs[0], top.refMap, ctx)}${points.length > 1 ? ` (+${points.length - 1} more)` : ''}`
-      : unitCapped ? ': not summarized (cap)' : ': nothing notable';
-    unitLines.push(`• ${escapeMrkdwn(u.bu)}: ${plural(active, 'active conversation', 'active conversations')}${tail}`);
+    lines.push('', `*Skipped*: ${plural(s.botHygiene, 'bot-hygiene item', 'bot-hygiene items')}, ${plural(s.botPosts, 'bot post', 'bot posts')}, ${plural(s.quietConversations, 'quiet channel', 'quiet channels')}`);
+    return lines.join('\n');
   }
-  items.sort((a, b) => a.order - b.order);
 
-  const notSummarized = [
-    counts.noCloud.conversations ? `${plural(counts.noCloud.conversations, 'conversation', 'conversations')} on the noCloud list (${counts.noCloud.messages} messages)` : null,
-    capped.calls ? `${plural(capped.calls, 'call', 'calls')} over the cap (${capped.messages} messages)` : null,
-    failed ? `${plural(failed, 'call', 'calls')} failed` : null,
-    counts.unreadable ? `${plural(counts.unreadable, 'conversation', 'conversations')} unreadable` : null,
-  ].filter(Boolean);
-  const riskTitle = `*${escapeMrkdwn(customerKey?.bu ?? 'Customer')} risks*: ${customersWithItems ? plural(customersWithItems, 'customer', 'customers') + ' with problems or risks' : 'none found'}`;
-  const tailLines = [
-    ...(unitLines.length ? ['', '*Other units*', ...unitLines] : []),
-    '', `*Not summarized*: ${notSummarized.length ? notSummarized.join('; ') : 'nothing'}`,
-    'Full digest attached.',
-  ];
+  // Shorten step by step until it fits the hard cap.
+  const steps = [];
+  for (const attention of [5, 4, 3, 2, 1]) {
+    for (const [watchWords, unitItems, headlineWords] of [[6, 3, 20], [6, 2, 20], [3, 2, 16], [0, 1, 14], [0, 1, 10]]) steps.push({ attention, watchWords, unitItems, headlineWords });
+  }
+  let text = '';
+  let used = steps[0];
+  for (const st of steps) {
+    used = st;
+    text = top(st);
+    if (text.length <= TOP_MAX) break;
+  }
+  if (text.length > TOP_MAX) text = `${text.slice(0, TOP_MAX - 2)}…`;
 
-  // Fit under MAX_CHARS: unit lines and the tail always stay; customer items are cut from the least severe.
-  const assemble = (n) => [...head, '', riskTitle, ...items.slice(0, n).map((i) => i.line),
-    ...(n < items.length ? [`…and ${items.length - n} more in the file`] : []), ...tailLines].join('\n');
-  let n = items.length;
-  let text = assemble(n);
-  while (text.length > MAX_CHARS && n > 0) text = assemble(--n);
-  if (text.length > MAX_CHARS) text = `${text.slice(0, MAX_CHARS - 30)}\n…(cut; see the file)`;
-  return { text, stats: { chars: text.length, customerItems: items.length, customerItemsShown: n, customersWithItems } };
+  // Thread: details for medium and high only, then brief units with links, other incidents, then the footer.
+  const foot = ['', '_' + footer.map(esc).join(' · ') + '_'].join('\n');
+  const parts = [];
+  for (const r of shown) {
+    const pts = r.points.filter((p) => p.severity !== 'low');
+    parts.push([`*${esc(r.name)}* ${ICON[r.severity]} ${esc(r.headline)}${r.leadership ? ' _(also discussed in Leadership)_' : ''}`,
+      ...pts.map((p) => `• ${p.severity}${p.botReport ? ' · bot report' : ''}: ${esc(p.summary)} ${p.evidence.map((e, i) => link(e, ctx, String(i + 1))).join(' ')}`)].join('\n'));
+  }
+  if (briefUnits.some((u) => u.points.length)) {
+    parts.push(['*Other units*', ...briefUnits.flatMap((u) => u.points.map((p) => `• ${esc(u.bu)}: ${esc(p.summary)} ${link(p.evidence[0], ctx)}`))].join('\n'));
+  }
+  if (model.incidents.length > 1) parts.push(['*Incidents*', ...model.incidents.map((i) => `• ${esc(i.source)}: ${esc(i.summary)} ${link(i.evidence[0], ctx)}`)].join('\n'));
+  let thread = '';
+  let included = 0;
+  for (const p of parts) {
+    const next = `${thread}${thread ? '\n\n' : ''}${p}`;
+    if (next.length + foot.length + 60 > THREAD_MAX) break;
+    thread = next;
+    included++;
+  }
+  if (included < parts.length) thread += `\n\n…${parts.length - included} more ${parts.length - included === 1 ? 'section' : 'sections'} in the archive file on the mini.`;
+  if (!thread) thread = 'No medium or high items.';
+  thread += `\n${foot}`;
+
+  return {
+    top: text, thread,
+    stats: { topChars: text.length, threadChars: thread.length, needsAttention: Math.min(used.attention, shown.length), watch: Math.max(0, shown.length - used.attention), threadSections: included, threadSectionsTotal: parts.length },
+  };
 }
 
-module.exports = { buildDm, MAX_CHARS };
+module.exports = { buildDm, TOP_MAX, THREAD_MAX };

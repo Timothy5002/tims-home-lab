@@ -11,6 +11,8 @@ data/*
 # real Slack business-unit rules (channel IDs, unit names); the example is tracked
 config/slack-bus.json
 config/slack-digest.json
+# real customer registry settings (company names, aliases); the example is tracked
+config/digest-customers.json
 # workspace-specific notes and open questions (real names, IDs)
 docs/private/
 .env

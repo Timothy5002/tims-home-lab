@@ -1,6 +1,6 @@
 # Slack digest: design and build plan
 
-**Status.** Phases 0, 1, 2 and 3 are built. Phase 3 includes Slack DM delivery, which was first planned as phase 6. Later phases are built only after the user approves each one.
+**Status.** Phases 0, 1, 2 and 3 are built, and so is the **redesign** that followed them: the customer registry, per-customer synthesis with Leadership mentions, noise rules, unit modes, and a two-part DM (top-level message and one thread reply, no file). Phase 3 includes Slack DM delivery, which was first planned as phase 6. How it runs: `docs/slack-digest.md`. Later phases are built only after the user approves each one.
 
 **Workspace details live elsewhere.** This doc names no real channels, business units or people. Those details, plus the open questions, are in `docs/private/` (git-ignored), and the rules themselves are in `config/` (git-ignored, with tracked examples).
 
@@ -18,7 +18,7 @@ For each of that unit's customers with activity since the last digest, the diges
 ## Hard rules (every phase)
 1. **Slack is read-only.**
    - The reader uses the existing user token (`~/.lab/slack-token`) and its fixed list of read methods. Its scopes are not widened, and it never writes.
-   - Delivery by DM (built in phase 3) uses the **same Slack app's bot token** (`~/.lab/slack-bot-token`), in a separate send-only client, `src/slack-send.js`. That client never reads and can post only into the verified DM with the configured user (user decision; a separate app was the earlier plan).
+   - Delivery by DM (built in phase 3) uses the **same Slack app's bot token** (`~/.lab/slack-bot-token`), in a separate send-only client, `src/slack-send.js`. That client never reads, never uploads, and can post only into the verified DM with the configured user, plus one reply under its own message (user decision; a separate app was the earlier plan).
 2. **Message text is untrusted data.**
    - The model gets no tools. Its system prompt says messages are data to analyze, never instructions.
    - Messages are sent as JSON-escaped fields.
@@ -97,7 +97,7 @@ A run fetches about 180 conversations (Slack calls spaced 1.3 s apart) and then 
 - pings its own healthchecks.io check: success, or `/fail` on any failure, abort or deadline. The URL comes from `~/.lab/healthcheck-url-slack-digest`, which the user creates before the schedule is installed. Suggested period 1 day, grace 2 hours.
 - writes one row to the `runs` table in `data/dispatcher.db`. The source is `launchd-direct`, or `manual` for hand runs, and the row holds counts and cost only.
 - enforces its own deadline of 25 minutes. It is a single process and starts no children.
-- records the success only after the digest file is written (temp file and rename), keeps the newest 14 digests, then delivers the DM (see "Delivery by Slack DM").
+- keeps the newest 14 digests, delivers the DM (see "Delivery by Slack DM"), then records the success, only if the delivery worked (temp file and rename). A failed delivery leaves the record, so the next run covers the window again.
 
 **Window.** Each run covers everything since the last successful scheduled run, capped at 72 hours, so Mondays and missed days are covered. The time of the last success is kept in `data/digest-state.json`, which holds a timestamp only. With no recorded run, the window is the last 24 hours. Hand runs never move that timestamp unless asked to.
 
@@ -111,19 +111,16 @@ A run fetches about 180 conversations (Slack calls spaced 1.3 s apart) and then 
    - Per template, keep the first and the latest example (cut to 300 characters), plus a count.
    - Always keep up to 5 instances containing alert words (error, failed, down, outage, escalate, urgent, cancel, refund, churn, complaint and similar).
    - The compression ratio is reported every run.
-4. **Group** by unit and sub-group. In the customer-success unit, each per-customer success channel is its own block. Phase 4 widens a block to all of that customer's channels.
+4. **Group** by the customer registry (each customer's success, coordination and external channels) and by unit mode (full, brief, off). Mentions of customers in Leadership and Internal channels are found by alias in code.
 5. **Plan under the caps.** Estimate input tokens (characters ÷ 4) before any model call. Customers go first, then sub-groups, busiest first. What does not fit the 400,000-token run cap is marked "not summarized (cap)" with counts, and the run does not abort. A call over the 100,000-token per-call cap keeps its newest messages.
 6. **Mask** external text (phase 2 onward). Phase 1 runs the masking on the would-be input and reports counts only.
-7. **Model calls** (phase 2 onward):
-   - one JSON call per active customer (risk extraction)
-   - one per other unit (short summary)
+7. **Model calls:**
+   - stage 1: one JSON call per active customer conversation (problems and risks, each with an evidence category)
+   - stage 2: one synthesis call per customer with findings or mentions (one headline, supporting points, all channels merged)
+   - one per full-mode sub-group that is not customers (archive only), one per brief-mode unit (at most 3 items), one incident check per off-mode unit
    - at most 3 at a time, each with a timeout, one primary retry and one fallback
-8. **Validate** replies against their schema and drop claims with invalid references. Sanitize model text by removing URLs, `<@…>`, `<!channel>`, `<!here>` and link syntax, so links only come from code and a crafted message cannot make the digest mention or link anyone.
-9. **Render** `data/digests/<date>.md` (mode 600). Order:
-   1. customer blocks (by health once phase 4 exists)
-   2. other units
-   3. a one-line list of quiet customers
-   4. a footer with counts, masking counts, tokens, cost and runtime
+8. **Validate** replies against their schema and drop claims with invalid references, and apply the noise rules in code: only evidence categories survive; bot hygiene, personnel and other items are dropped and counted; severity, the Leadership flag, the best link and "bot report" are decided in code. Sanitize model text by removing URLs, `<@…>`, `<!channel>`, `<!here>` and link syntax, so links only come from code and a crafted message cannot make the digest mention or link anyone.
+9. **Render** `data/digests/<date>.md` (mode 600), merged by customer: notable customers ranked (severity, Leadership, strong points, volume) with every point including low ones, quiet customers on one line, incidents, units by mode, skipped counts, and a footer with counts, masking counts, tokens, cost and runtime.
 10. **Finish.** Record the success, prune old digests, send the DM when scheduled, drop all text, write the run row, and ping the healthcheck when scheduled.
 
 **Links** are built in code from the workspace URL in `config/slack-digest.json`: `<workspace>/archives/<channel>/p<ts without the dot>`. Thread replies add `?thread_ts=<parent>&cid=<channel>`.
@@ -159,23 +156,22 @@ A run fetches about 180 conversations (Slack calls spaced 1.3 s apart) and then 
 
 It checks the `notable` flags, the expected issues, that every reference is valid, and that the injection is ignored.
 
-## Customer registry (phase 4, not yet approved)
-- **`config/digest-customers.json`** (git-ignored, with a tracked example). For each customer: name, aliases, success channel, external channels and owner.
-- **Seeding is code:** proposed entries are matched from channel names, and the user confirms them.
-- **Health** is runtime state in `data/digest-health.json`, set with `node scripts/digest-customers.js set-health <customer> red|yellow|green [--note "..."]`.
-- **Ordering:** Red customers are listed first.
+## Customer registry (built in the redesign; health not yet approved)
+- **`config/digest-customers.json`** (git-ignored, with a tracked example): prefixes, suffixes and filler words for deriving keys from channel names, extra keys, aliases, hand assignments, general channels and mention channels.
+- **Derivation is code:** success channels define customers; other customer channels join by key; unmatched channels are listed and still analyzed. `node scripts/digest-customers.js` prints the registry for review.
+- **Not built:** health as runtime state (`set-health red|yellow|green`) and ordering by health, and owners.
 
-## Leadership-contradiction check (phase 5, not yet approved)
+## Leadership-contradiction check (phase 5, not yet approved; the redesign only flags that Leadership discussed a customer)
 1. **Find candidate pairs in code.** Take messages in the unit's leadership channels from configured people that mention a registered customer. Pair each with that customer's success-channel messages, over the window plus a short lookback.
 2. **Ask the model** for conflicts, each with both references and both quotes.
 3. **Verify in code.** Keep a conflict only if both quotes are exact parts of the masked text the model saw. Each kept conflict is shown as "**Possible conflict, verify**" with both links.
 4. **Test** against real past cases the user supplies, plus invented near-misses that must not be flagged.
 
-## Delivery by Slack DM (built in phase 3)
-- **The same Slack app** as the reader. Its bot token (`~/.lab/slack-bot-token`, mode 600, Authorization header only) has `chat:write`, `im:write` and `files:write`. No events and no read scopes are used with it.
-- **Four methods only:** `conversations.open`, `chat.postMessage`, `files.getUploadURLExternal`, `files.completeUploadExternal`. The client refuses any other method, posts only after `conversations.open` returns a 1:1 DM whose user is the configured ID (`deliverTo`, git-ignored), and has no channel argument. File bytes go only to an `https` upload URL on slack.com.
-- **What is sent:** a short message under about 3,000 characters (date and model; the customer group's risks, one line per item with its link; one line per other unit; not-summarized counts), then the full digest file uploaded to the same DM.
-- **The file stays the record:** if delivery fails, the digest file is kept, the success is recorded, and the healthcheck gets `/fail` with the reason code.
+## Delivery by Slack DM (built in phase 3, reshaped in the redesign)
+- **The same Slack app** as the reader. Its bot token (`~/.lab/slack-bot-token`, mode 600, Authorization header only) uses `chat:write` and `im:write`. No events, no file uploads and no read scopes are used with it.
+- **Two methods only:** `conversations.open` and `chat.postMessage`. The client refuses any other method, posts only after `conversations.open` returns a 1:1 DM whose user is the configured ID (`deliverTo`, git-ignored), has no channel argument, and replies only under its own message.
+- **What is sent:** a top-level message (hard cap 1,500 characters: title, Needs attention with at most 5 customers, Watch, Incident, Other units, Skipped), then one threaded reply with per-customer bullets and links (medium and high only) and the model, provider, fallback and cost footer. Nothing is uploaded; the archive file stays on the mini.
+- **If delivery fails:** the digest file is kept, the success is **not** recorded (the next run covers the window again), and the healthcheck gets `/fail` with the reason code.
 - **Manual steps for the user:** creating and installing the app, its scopes and the App Home Messages tab are done in Slack's web UI.
 
 ## Cost controls
@@ -200,13 +196,14 @@ It checks the `notable` flags, the expected issues, that every reference is vali
 | 1 | **Fetch, bot compression, code-only digest** (no model calls) | built | Fetch runtime; compression ratio; masking counts on the would-be input; nothing but the digest on disk; links open the right messages |
 | 2 | **Risk extraction and unit summaries**, plus `scripts/digest-eval.js` | built | Eval passes; every claim has a valid reference; the injection is ignored; real cost |
 | 3 | **Morning schedule** (standalone launchd) **and Slack DM delivery** (same app, bot token), primary retry, 400k run cap | built | `kickstart` run, healthcheck ping, run row, DM and file in the user's DM only |
-| 4 | **Customer registry and health** | needs approval | Blocks draw from all of a customer's channels; Red first |
+| R | **Redesign:** customer registry, synthesis per customer, Leadership mentions, noise rules, unit modes, two-part DM | built | registry printed for review; eval and self-tests; a `kickstart` run delivered to the DM |
+| 4 | **Customer health** (the registry itself is built in the redesign) | needs approval | Red first |
 | 5 | **Leadership-contradiction check** | needs approval and the past cases | Real cases flagged with verified quotes; near-misses not flagged |
 | 6 | ~~Slack DM delivery~~ | moved into phase 3 | |
 
 ## Files
-- **Code:** `src/slack.js` (shared read-only Slack client and unit rules), `src/slack-send.js` (send-only DM client), `src/secrets.js`, `src/healthcheck.js`, `src/openrouter.js`, `src/mask.js`, `src/digest/` (run, fetch, compress, analyze, prompts, render, dm)
+- **Code:** `src/slack.js` (shared read-only Slack client and unit rules), `src/slack-send.js` (send-only DM client), `src/secrets.js`, `src/healthcheck.js`, `src/openrouter.js`, `src/mask.js`, `src/digest/` (run, fetch, compress, customers, pipeline, analyze, prompts, render, dm)
 - **Schedule:** `launchd/com.lab.schedule.slack-digest.plist`
-- **Scripts:** `scripts/model-check.js`, `scripts/digest-selftest.js`, `scripts/digest-eval.js`, `scripts/digest-dm-test.js`, later `scripts/digest-customers.js`
-- **Config:** `config/slack-digest.example.json` (workspace URL, model routes, caps, noCloud), `config/slack-bus.example.json` (unit rules and external rule)
+- **Scripts:** `scripts/model-check.js`, `scripts/digest-selftest.js`, `scripts/digest-eval.js`, `scripts/digest-dm-test.js`, `scripts/digest-customers.js` (prints the registry)
+- **Config:** `config/slack-digest.example.json` (workspace URL, model routes, caps, noCloud, unit modes, recipient), `config/digest-customers.example.json` (customer registry settings), `config/slack-bus.example.json` (unit rules and external rule)
 - **Docs:** this file, `docs/slack-digest.md` (how to run it), `docs/decisions.md`, README, CLAUDE.md
