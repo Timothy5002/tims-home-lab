@@ -78,7 +78,7 @@ The digest calls models through **OpenRouter's OpenAI-compatible API** (`POST ht
 
 Fallbacks should be rare. A digest written by the secondary can read differently, and that is accepted.
 
-**Served-provider check.** The chat reply does not say which provider served it, so after each reply the client reads OpenRouter's generation stats (`GET /api/v1/generation?id=…`). A provider that is not pinned, or one that cannot be confirmed, counts as a mismatch.
+**Served-provider check.** After each reply the client checks two sources: the reply's own `provider` field, and OpenRouter's generation stats (`GET /api/v1/generation?id=…`). The stats take about 15 s to appear, so it waits up to about 30 s with growing gaps. At least one source must name a provider, and every source that names one must name a pinned provider. Anything else, including no answer from either source, counts as a mismatch.
 
 **What is logged and shown:**
 - **Per run, no text:** which model and provider served each call.

@@ -161,8 +161,8 @@ function fakeOpenRouter(chatReplies) {
     if (typeof r === 'function') return r(init);
     if (r && 'status' in r) return r;
     const id = `gen-test-${calls.chat.length}`;
-    served.set(id, { provider_name: r.provider, total_cost: r.cost ?? null });
-    return json(200, { id, model: body.model, choices: [{ message: { content: r.content }, finish_reason: 'stop' }],
+    if (r.provider) served.set(id, { provider_name: r.provider, total_cost: r.cost ?? null });
+    return json(200, { id, model: body.model, ...(r.replyProvider ? { provider: r.replyProvider } : {}), choices: [{ message: { content: r.content }, finish_reason: 'stop' }],
       usage: r.usage ?? { prompt_tokens: 100, completion_tokens: 20, prompt_tokens_details: { cached_tokens: 0 }, completion_tokens_details: { reasoning_tokens: 0 } } });
   };
   f.calls = calls;
@@ -223,6 +223,22 @@ const hang = (init) => new Promise((_, reject) => {
     const f = fakeOpenRouter([{ content: '{"ok":true}', provider: 'Venice' }, { content: '{"ok":true}', provider: 'Google AI Studio' }]);
     const e = await errOf(chat({ ...base, fetchImpl: f }));
     check('openrouter: secondary served by an unpinned provider fails the call', e?.code === 'provider-mismatch' && f.calls.chat.length === 2, e?.message);
+  }
+  {
+    // Provider confirmation: the reply's own provider field counts; stats that never appear make it unconfirmed.
+    const f = fakeOpenRouter([{ content: '{"ok":1}', replyProvider: 'DeepInfra' }]);
+    const seen = [];
+    const r = await chat({ ...base, fetchImpl: f, debug: (d) => seen.push(d) });
+    check('openrouter: provider confirmed from the reply field when stats never appear (waits through ~30 s of backoff)',
+      r.provider === 'DeepInfra' && f.calls.generation.length === 8 && seen[0]?.statsTries.length === 8, JSON.stringify(seen[0]));
+    check('openrouter: debug output has field names, ids and statuses only',
+      Array.isArray(seen[0]?.replyFields) && !JSON.stringify(seen[0]).includes('"ok"') && !JSON.stringify(seen[0]).includes(FAKE_KEY));
+    const f2 = fakeOpenRouter([{ content: '{}' }, { content: '{}' }]);
+    const e2 = await errOf(chat({ ...base, fetchImpl: f2 }));
+    check('openrouter: no provider from either source is a mismatch (strict), on both routes', e2?.code === 'provider-mismatch' && f2.calls.chat.length === 2, e2?.message);
+    const f3 = fakeOpenRouter([{ content: '{}', provider: 'DeepInfra', replyProvider: 'Venice' }, { content: '{}', provider: 'Google' }]);
+    const r3 = await chat({ ...base, fetchImpl: f3 });
+    check('openrouter: sources disagreeing (one unpinned) is a mismatch', r3.fellBack && r3.primaryError === 'provider-mismatch');
   }
   for (const [label, first, code] of [
     ['401', json(401, {}), 'auth'],

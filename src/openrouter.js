@@ -138,21 +138,33 @@ function createBudget({ maxInputTokens = 122_000, maxOutputTokens = 60_000, maxC
   };
 }
 
-// Which provider served a generation, and what it cost (stats can lag a moment behind the reply).
-async function generationStats(id, { fetchImpl, key, sleepImpl, tries = 5 }) {
-  for (let i = 0; i < tries; i++) {
-    const res = await fetchImpl(`${BASE_URL}/generation?id=${encodeURIComponent(id)}`, {
-      headers: { Authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(15_000),
-    });
-    if (res.ok) {
-      const d = (await res.json()).data ?? {};
-      if (d.provider_name) return { provider: d.provider_name, costUsd: Number.isFinite(d.total_cost) ? d.total_cost : null };
-    } else if (res.status !== 404) {
-      break;
+// Which provider served a generation, and what it cost. The stats can take a while to appear after the reply,
+// so this waits up to about 30 s with growing gaps. Returns { provider, costUsd, tries: [HTTP status, ...] }.
+const STATS_DELAYS_MS = [1000, 2000, 3000, 4000, 5000, 6000, 8000]; // about 29 s in total
+async function generationStats(id, { fetchImpl, key, sleepImpl }) {
+  const tries = [];
+  for (let i = 0; i <= STATS_DELAYS_MS.length; i++) {
+    let res;
+    try {
+      res = await fetchImpl(`${BASE_URL}/generation?id=${encodeURIComponent(id)}`, {
+        headers: { Authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(15_000),
+      });
+    } catch {
+      tries.push('network-error');
+      res = null;
     }
-    await sleepImpl(500 * (i + 1));
+    if (res) {
+      tries.push(res.status);
+      if (res.ok) {
+        const d = (await res.json()).data ?? {};
+        if (d.provider_name) return { provider: d.provider_name, costUsd: Number.isFinite(d.total_cost) ? d.total_cost : null, tries };
+      } else if (res.status !== 404 && res.status !== 429 && res.status < 500) {
+        break; // auth or bad request: waiting will not help
+      }
+    }
+    if (i < STATS_DELAYS_MS.length) await sleepImpl(STATS_DELAYS_MS[i]);
   }
-  return null;
+  return { provider: null, costUsd: null, tries };
 }
 
 // One attempt on one route. Throws ModelError; FALLBACK_CODES decide whether the secondary is tried.
@@ -195,14 +207,22 @@ async function attempt(route, opts, ctx) {
     reasoning: u.completion_tokens_details?.reasoning_tokens ?? 0,
     cached: u.prompt_tokens_details?.cached_tokens ?? 0,
   };
-  const stats = data.id ? await generationStats(data.id, { fetchImpl: ctx.fetchImpl, key: ctx.key, sleepImpl: ctx.sleepImpl }) : null;
-  const costUsd = stats?.costUsd ?? (Number.isFinite(u.cost) ? u.cost : costFromPrices(prices, usage));
+  const stats = data.id ? await generationStats(data.id, { fetchImpl: ctx.fetchImpl, key: ctx.key, sleepImpl: ctx.sleepImpl }) : { provider: null, costUsd: null, tries: [] };
+  const costUsd = stats.costUsd ?? (Number.isFinite(u.cost) ? u.cost : costFromPrices(prices, usage));
   if (opts.budget) opts.budget.add(usage, costUsd);
-  const result = { route: route.name, model: data.model ?? route.model, provider: stats?.provider ?? null, usage, costUsd, id: data.id ?? null };
+  // Provider names from both sources: the reply's own "provider" field (if present) and the generation stats.
+  const replyProvider = typeof data.provider === 'string' ? data.provider : null;
+  const named = [replyProvider, stats.provider].filter(Boolean);
+  const result = { route: route.name, model: data.model ?? route.model, provider: stats.provider ?? replyProvider, usage, costUsd, id: data.id ?? null };
+  if (opts.debug) {
+    // Field names, statuses, ids and provider names only; never message text, never the key.
+    opts.debug({ route: route.name, replyFields: Object.keys(data), generationId: data.id ?? null, replyProvider, statsProvider: stats.provider, statsTries: stats.tries });
+  }
 
-  // The pinned provider must have served it; an unverifiable provider counts as a mismatch.
-  if (!stats || !prices.providerNames.includes(stats.provider)) {
-    throw new ModelError('provider-mismatch', `served by ${stats?.provider ?? 'an unverified provider'}; pinned: ${prices.providerNames.join(', ')}`, { result });
+  // The pinned provider must have served it: at least one source names a provider, and every source that does
+  // names a pinned one. If neither source answers, the provider is unconfirmed, and that counts as a mismatch.
+  if (!named.length || !named.every((n) => prices.providerNames.includes(n))) {
+    throw new ModelError('provider-mismatch', `served by ${named.join(' / ') || 'an unconfirmed provider'}; pinned: ${prices.providerNames.join(', ')}`, { result });
   }
   const content = data.choices?.[0]?.message?.content ?? '';
   if (!content.trim()) throw new ModelError('empty', 'empty reply', { result });

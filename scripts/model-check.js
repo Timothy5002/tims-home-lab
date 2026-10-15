@@ -4,8 +4,10 @@
 // OpenRouter's generation stats), token counts, reasoning tokens and cost. It also checks that the JSON reply
 // parses into the expected shape. Exits non-zero if a route is served by a provider that is not pinned, or the
 // shape is wrong. Never prints the key. Each route is called directly (no primary-to-secondary fallback).
-// Usage: node scripts/model-check.js [--dry-run] [--route primary|secondary]
+// Usage: node scripts/model-check.js [--dry-run] [--debug] [--route primary|secondary]
 //   --dry-run  print the request bodies and live endpoint prices only; no model calls
+//   --debug    also print the reply's top-level field names, the generation id, the provider each source named
+//              and the generation-stats HTTP status per try (no message text, no key)
 const fs = require('node:fs');
 const path = require('node:path');
 const { parseArgs } = require('node:util');
@@ -22,7 +24,7 @@ function shapeOk(j) {
 }
 
 (async () => {
-  const { values: opts } = parseArgs({ options: { 'dry-run': { type: 'boolean', default: false }, route: { type: 'string' } } });
+  const { values: opts } = parseArgs({ options: { 'dry-run': { type: 'boolean', default: false }, debug: { type: 'boolean', default: false }, route: { type: 'string' } } });
   const routes = loadRoutes(JSON.parse(fs.readFileSync(CONFIG, 'utf8')).models);
   const names = opts.route ? [opts.route] : ['primary', 'secondary'].filter((n) => routes[n]);
   let failed = false;
@@ -39,7 +41,8 @@ function shapeOk(j) {
     console.log(JSON.stringify(buildBody(route, { system: SYSTEM, user: USER, maxTokens: 200 }), null, 2));
     if (opts['dry-run']) continue;
     try {
-      const r = await chat({ routes, only: name, system: SYSTEM, user: USER, maxTokens: 200 });
+      const debug = opts.debug ? (d) => console.log(`Debug: ${JSON.stringify(d)}`) : undefined;
+      const r = await chat({ routes, only: name, system: SYSTEM, user: USER, maxTokens: 200, debug });
       const u = r.usage;
       console.log(`Model id: ${r.model}`);
       console.log(`Served by: ${r.provider} (pinned: ${prices.providerNames.join(', ')})`);

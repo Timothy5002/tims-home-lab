@@ -15,6 +15,7 @@ The design, rules and phases are in [slack-digest-design.md](slack-digest-design
 ```bash
 node scripts/model-check.js --dry-run   # request bodies (no key) and live prices; no model calls
 node scripts/model-check.js             # one invented sentence to each route
+node scripts/model-check.js --debug     # also: reply field names, generation id, provider per source, stats HTTP status per try
 ```
 `config/slack-digest.json` (`models`) defines two routes:
 - **primary:** DeepSeek V3.2, pinned to DeepInfra
