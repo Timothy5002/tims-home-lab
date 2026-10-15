@@ -13,7 +13,7 @@ For each of that unit's customers with activity since the last digest, the diges
 - Assigned conversations averaged about **43,000 tokens/day** and peaked at **61,000**.
 - The customer-success unit was 85% of that, and its per-customer success channels 69%.
 - Bots wrote 54% of all characters.
-- The local 7B model would need about 20 minutes and 23 to 33 calls a day, and is too weak for this kind of judgment, so judgment steps use a cloud model (DeepSeek), approved by the user.
+- The local 7B model would need about 20 minutes and 23 to 33 calls a day, and is too weak for this kind of judgment, so judgment steps use a cloud model through OpenRouter, approved by the user.
 
 ## Hard rules (every phase)
 1. **Slack is read-only.**
@@ -26,57 +26,69 @@ For each of that unit's customers with activity since the last digest, the diges
 3. **No evidence, no claim.**
    - The model cites short references (`m017`) and never writes links. Code checks every reference against the messages it sent, drops claims with no valid reference, and builds the Slack link itself.
    - Where quotes are required, code checks that each quote is an exact part of the **masked** text the model saw. The link still points to the original message.
-4. **Masking before any model call** (external conversations only; see below).
+4. **Masking before any model call.** Secrets are masked in every conversation; the full masking applies to external conversations (see below). Names are never masked.
 5. **Retention.**
    - Message text lives only in the process's memory until the digest is written. There are no temp files.
    - Logs, the SQLite run row and cost records hold counts, token usage, cost, durations and error codes, never text (masked or original).
    - Only the digest persists: `data/digests/<date>.md`, mode 600, git-ignored.
-   - Text sent to the cloud model is also kept by the provider under its own terms.
-6. **No real Slack text goes to any model until phase 2 is approved.** Phases 0 and 1 use invented text for every model call. Phase 1 makes no model calls at all.
-7. **Secrets.** The DeepSeek key is read only from `~/.lab/deepseek-key`, with mode 600 enforced. It goes only in the `Authorization` header, never on a command line, in an env var, in a log or in the repo.
+   - Requests ask OpenRouter for providers that do not store data (`data_collection: "deny"`).
+6. **No real Slack text goes to any model until phase 2 is approved.** Phases 0 and 1 use invented text for every model call. Phase 1 makes no model calls at all. A configurable `noCloud` list names conversations that are never sent to any model; the digest shows them as "not summarized" with counts only.
+7. **Secrets.** The OpenRouter key is read only from `~/.lab/openrouter-key`, with mode 600 enforced. It goes only in the `Authorization` header, never on a command line, in an env var, in a log or in the repo. A monthly spend limit is set on the key in OpenRouter's dashboard.
 8. **Evals before trust.** No prompt is trusted until `scripts/digest-eval.js` passes on labeled, invented sample days. Every prompt change re-runs it.
 
 ## Masking
-**Which conversations are masked.** A conversation is **external** if either rule says so:
-- **Rule 1 (configured):** it belongs to a unit listed in the config's external units, and its name does not start with one of that unit's internal prefixes. This covers the unit's group DMs too, since their names never start with the prefix.
-- **Rule 2 (Slack's own flag):** Slack marks it as externally shared (`is_ext_shared`, used by Slack Connect). The channel listing records this field from now on. Listings made before that change do not have it, so rule 2 applies only after the next listing. No extra Slack call is made.
+**Data-sharing decision (recorded by the user).** Slack text may go to the pinned providers below, names included.
+- **Internal conversations go unmasked**, except for secrets. Internal means the customer unit's per-customer success channels and every conversation in every other unit.
+- **External conversations get the full masking.** A conversation is external if either rule says so:
+  - **Rule 1 (configured):** it belongs to a unit listed in the config's external units, and its name does not start with one of that unit's internal prefixes. This covers the unit's group DMs too.
+  - **Rule 2 (Slack's own flag):** Slack marks it as externally shared (`is_ext_shared`, Slack Connect). The channel listing records this field.
+- **Secrets are masked in every conversation**, internal ones included, and counted per run.
 
-The flag is derived by code from the config and the listing; it is not stored by hand. `node scripts/slack-channels.js --from-cache` prints which conversations are external and why.
+The external flag is derived by code from the config and the listing; it is not stored by hand. `node scripts/slack-channels.js --from-cache` prints which conversations are external.
 
-**What is masked**, in code, in external conversations, before any text is sent to a model:
+**What is masked** (in code, before any text is sent to a model):
 
-| Found | Replaced with |
-|---|---|
-| Email addresses, including `<a@b.com>` and Slack's `<mailto:a@b.com\|label>` markup | `[email]` |
-| Phone numbers, including spaces, dots, dashes, brackets and `+` country codes | `[phone]` |
-| Runs of 6 or more digits | `[number]` |
-| URLs with a query string, or with a token-like path segment | `[url]` (plain URLs without either are kept) |
-| Secret-looking strings: `sk-…`, `xox…`, `ghp_…`, AWS key IDs, JWTs, long hex or base64 | `[secret]` |
+| Found | Replaced with | Where |
+|---|---|---|
+| Secret-looking strings: `sk-…`, `xox…`, `ghp_…`, AWS key IDs, JWTs, long hex or base64 | `[secret]` | every conversation |
+| Email addresses, including `<a@b.com>` and Slack's `<mailto:a@b.com\|label>` markup | `[email]` | external |
+| Phone numbers, including spaces, dots, dashes, brackets and `+` country codes | `[phone]` | external |
+| Runs of 6 or more digits | `[number]` | external |
+| URLs with a query string, or with a token-like path segment (plain URLs are kept) | `[url]` | external |
 
-- Each run keeps a count of masked items by type. Neither the masked nor the original text is logged or stored.
-- `scripts/digest-selftest.js` tests masking with invented examples.
+- **Names are never masked.**
+- **Counting:** each run counts masked items by type. Neither the masked nor the original text is logged or stored.
+- **Testing:** `scripts/digest-selftest.js` tests masking with invented examples. `node src/digest/run.js --from … --to … --mask-report` lists which pattern fired on which message (pattern name, conversation ID and message time, never text) to check for false positives.
 
 ## Model and provider
-Checked against DeepSeek's documentation on 2026-10-14 ([pricing](https://api-docs.deepseek.com/quick_start/pricing), [change log](https://api-docs.deepseek.com/updates), [thinking mode](https://api-docs.deepseek.com/guides/thinking_mode), [JSON output](https://api-docs.deepseek.com/guides/json_mode)):
+The digest calls models through **OpenRouter's OpenAI-compatible API** (`POST https://openrouter.ai/api/v1/chat/completions`, host hardcoded) from `src/openrouter.js`. That client is plain `fetch`, with no SDK and no new dependency. `src/llm.js` stays local-only.
 
-- **Model: `deepseek-flash` (DeepSeek-V4.1-Flash).** The originally planned `deepseek-chat` (V3.2) was discontinued on 2026-07-24. `scripts/deepseek-check.js` confirms the exact id with a live call on invented text.
-- **Endpoint:** `POST https://api.deepseek.com/chat/completions` (OpenAI format), with `Authorization: Bearer <key>`. The host is hardcoded.
-- **Thinking mode is off by default** (`"thinking": {"type": "disabled"}`), with a flag to turn it on. Thinking mode ignores `temperature` and is billed for reasoning tokens.
-- **JSON output** uses `"response_format": {"type": "json_object"}`.
-  - The prompt must mention "json" and show an example of the shape.
-  - `max_tokens` must be high enough that the JSON is not cut off.
-  - The docs warn of occasional empty replies, so an empty or invalid reply is a retryable failure.
-- **Prices (USD per million tokens), checked 2026-10-14:**
+**Two routes**, both in `config/slack-digest.json` (`models`), each **pinned to its own provider**:
 
-  | `deepseek-flash` | off-peak | peak |
-  |---|---|---|
-  | input, cache hit | 0.003 | 0.006 |
-  | input, cache miss | 0.15 | 0.30 |
-  | output | 0.60 | 1.20 |
+| Route | Model | Pinned provider | Reasoning |
+|---|---|---|---|
+| primary | `deepseek/deepseek-v3.2` | DeepInfra | off by default (`reasoning.enabled: false`); a flag turns it on |
+| secondary | `google/gemini-3.8-flash` | Google Vertex (standard endpoint) | cannot be turned off; uses the lowest level (`reasoning.effort: "low"`) |
 
-  Peak is weekdays 01:00 to 04:00 and 06:00 to 10:00 UTC, except Chinese public holidays. The run is at 06:00 on this Mac, which is US Central (11:00 or 12:00 UTC), so it is always **off-peak**. The price table lives in code with its check date, and each run logs which rate applied.
-- **Expected cost:** roughly $0.01 to $0.02 per day off-peak, under $1 a month. Phase 2 measures the real figure.
-- **Code:** `src/deepseek.js`, built on Node's built-in `fetch` with no SDK and no new dependency. `src/llm.js` stays local-only.
+**Every request** carries `provider: { order, only, allow_fallbacks: false, require_parameters: true, data_collection: "deny" }`, so OpenRouter never routes to another provider, to one that ignores a parameter such as `response_format`, or to one that may store data. It also uses JSON mode (`response_format: {type: "json_object"}`) and has no tools. Temperature (0.1) is sent only where the pinned endpoint accepts it and reasoning is off.
+
+**Fallback, in code, never by OpenRouter:**
+1. Try the primary.
+2. On a timeout, a 5xx, a 429, or a reply served by a provider that is not pinned, try the secondary **once**. There is never a third attempt, and never two models in one request.
+3. Anything else fails the call: auth, out of credit, no endpoint fits the pins or data policy, an empty or invalid reply.
+
+Fallbacks should be rare. A digest written by the secondary can read differently, and that is accepted.
+
+**Served-provider check.** The chat reply does not say which provider served it, so after each reply the client reads OpenRouter's generation stats (`GET /api/v1/generation?id=…`). A provider that is not pinned, or one that cannot be confirmed, counts as a mismatch.
+
+**What is logged and shown:**
+- **Per run, no text:** which model and provider served each call.
+- **In the digest:** the header names the model that wrote it.
+- **In the healthcheck:** if the secondary served, the ping body says so (phase 3).
+
+**Cost** comes from OpenRouter: the generation's total cost. When it is missing, it is computed from **live per-token prices** that the client reads from OpenRouter's public endpoint list (`/api/v1/models/<model>/endpoints`) for the pinned endpoints. Reasoning tokens count as output for both cost and the output cap. There is no time-of-day pricing logic: the pinned endpoints report flat prices. If a pinned slug could also match dearer tiers of the same provider, the per-run cost cap assumes the dearest. `scripts/model-check.js --dry-run` prints the live prices.
+
+**Check:** `scripts/model-check.js` sends one invented sentence to each route. It prints the model id, the provider that served it, token counts and cost, and checks that the JSON reply has the expected shape. It exits with an error if the provider is not the pinned one, and never prints the key.
 
 ## How it runs
 A run fetches about 180 conversations (Slack calls spaced 1.3 s apart) and then makes model calls. That is far over the dispatcher's 60-second job limit.
@@ -160,28 +172,30 @@ It checks the `notable` flags, the expected issues, that every reference is vali
 ## Cost controls
 | Control | Value |
 |---|---|
-| Per-run input cap (estimated tokens) | 122,000, which is 2× the measured peak. Over it, the run aborts before any model call |
+| Per-run input cap (estimated tokens) | 122,000, which is 2× the measured peak. A call that would pass it is refused before it is sent |
+| Per-run output cap | 60,000 tokens, reasoning included |
+| Per-run cost cap | $0.50, checked before each call against the worst case for whichever route is about to run |
 | Output cap per call | about 1,500 tokens per customer, about 800 per unit summary |
 | Timeout per model call | 90 s |
-| Retries | 3, with exponential backoff and jitter, on 429 (honoring `Retry-After`), 5xx, network errors and empty or invalid JSON |
+| Retries | none within a route; one attempt on the secondary after a timeout, 5xx, 429 or provider mismatch |
 | Run deadline | 25 min |
 | Concurrency | at most 3 model calls |
 | Month-to-date spend cap | to be decided |
-| Logged per run (no text) | conversations, messages, characters, compression ratio, masked items by type, model calls, retries, input tokens (cache hit and miss), output tokens, estimated cost, rate, runtime, dropped claims |
+| Logged per run (no text) | conversations, messages, characters, compression ratio, masked items by type, model calls, fallbacks, model and provider per call, input tokens (cached and not), output and reasoning tokens, cost, runtime, dropped claims |
 
 ## Phases
 | # | Phase | Status | What it tests |
 |---|---|---|---|
-| 0 | **Groundwork.** Shared Slack client in `src/`, `src/deepseek.js` (key check, no tools, JSON mode, thinking flag, timeouts, retries, usage and cost, input cap), masking, external flag | approved | A live call on **invented** text confirms the model id and logs usage and cost. Self-tests with invented data cover masking and every guard: loose key file, over-cap input, timeout, 429, empty JSON |
-| 1 | **Fetch, bot compression, code-only digest** (no model calls) | approved | Fetch runtime; compression ratio; masking counts on the would-be input; nothing but the digest on disk; links open the right messages |
-| 2 | **Risk extraction and unit summaries**, plus `scripts/digest-eval.js` | needs approval and the data-sharing answer | Eval passes; every claim has a valid reference; the injection is ignored; real cost |
+| 0 | **Groundwork.** Shared Slack client in `src/`, `src/openrouter.js` (key check, pinned providers, no tools, JSON mode, reasoning handling, timeouts, primary/secondary fallback, served-provider check, live prices, caps), masking, external flag | built | `scripts/model-check.js` sends **invented** text to each route and checks model, provider, tokens, cost and JSON shape. Self-tests with invented data cover masking, fallback, caps and every guard |
+| 1 | **Fetch, bot compression, code-only digest** (no model calls) | built | Fetch runtime; compression ratio; masking counts on the would-be input; nothing but the digest on disk; links open the right messages |
+| 2 | **Risk extraction and unit summaries**, plus `scripts/digest-eval.js` | needs approval (data sharing decided) | Eval passes; every claim has a valid reference; the injection is ignored; real cost |
 | 3 | **Morning schedule** (standalone launchd) | needs approval and a new healthchecks.io URL | `kickstart` run, both healthcheck pings, run row |
 | 4 | **Customer registry and health** | needs approval | Blocks draw from all of a customer's channels; Red first |
 | 5 | **Leadership-contradiction check** | needs approval and the past cases | Real cases flagged with verified quotes; near-misses not flagged |
 | 6 | **Slack DM delivery** (separate app) | needs approval and the app | DMs reach only the user; other targets are refused |
 
 ## Files
-- **Code:** `src/slack.js` (shared read-only Slack client and unit rules), `src/secrets.js`, `src/deepseek.js`, `src/mask.js`, `src/digest/` (run, fetch, compress, render)
-- **Scripts:** `scripts/deepseek-check.js`, `scripts/digest-selftest.js`, later `scripts/digest-eval.js` and `scripts/digest-customers.js`
-- **Config:** `config/slack-digest.example.json` (workspace URL, caps), `config/slack-bus.example.json` (unit rules and external rule)
+- **Code:** `src/slack.js` (shared read-only Slack client and unit rules), `src/secrets.js`, `src/openrouter.js`, `src/mask.js`, `src/digest/` (run, fetch, compress, render)
+- **Scripts:** `scripts/model-check.js`, `scripts/digest-selftest.js`, later `scripts/digest-eval.js` and `scripts/digest-customers.js`
+- **Config:** `config/slack-digest.example.json` (workspace URL, model routes, caps, noCloud), `config/slack-bus.example.json` (unit rules and external rule)
 - **Docs:** this file, `docs/slack-digest.md` (how to run it), `docs/decisions.md`, README, CLAUDE.md

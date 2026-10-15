@@ -15,5 +15,41 @@
     "sub": "Customers"
   },
   "myName": "Your display name",
-  "_keys": "workspaceUrl: for message links. threadLookbackDays: how far back to look for threads with new replies. maxWindowHours/defaultWindowHours: window cap and first-run window. maxInputTokens: per-run cap. runDeadlineMinutes: the run gives up after this. unitOrder: unit order in the digest. customerGroup: the unit > sub-group whose conversations are customers (shown first, quiet ones named). myName: left out of group DM labels."
+  "_keys": "workspaceUrl: for message links. threadLookbackDays: how far back to look for threads with new replies. maxWindowHours/defaultWindowHours: window cap and first-run window. maxInputTokens: per-run cap. runDeadlineMinutes: the run gives up after this. unitOrder: unit order in the digest. customerGroup: the unit > sub-group whose conversations are customers (shown first, quiet ones named). myName: left out of group DM labels.",
+  "models": {
+    "primary": {
+      "model": "deepseek/deepseek-v3.2",
+      "providers": [
+        "deepinfra"
+      ],
+      "temperature": true,
+      "reasoningMandatory": false,
+      "reasoningOff": {
+        "enabled": false
+      },
+      "reasoningOn": {
+        "enabled": true
+      },
+      "reasoningAllowance": 4096
+    },
+    "secondary": {
+      "model": "google/gemini-3.8-flash",
+      "providers": [
+        "google-vertex/global"
+      ],
+      "temperature": false,
+      "reasoningMandatory": true,
+      "reasoningOff": {
+        "effort": "low"
+      },
+      "reasoningOn": {
+        "effort": "high"
+      },
+      "reasoningAllowance": 4096
+    }
+  },
+  "maxRunCostUsd": 0.5,
+  "maxOutputTokens": 60000,
+  "noCloud": [],
+  "_models": "primary is tried first; secondary once, only on timeout, 5xx, 429 or a provider mismatch. providers are OpenRouter provider slugs, pinned with no fallbacks and data_collection deny. temperature: whether the pinned endpoint accepts it. reasoningMandatory: the model cannot turn reasoning off (reasoningOff is then its lowest level). reasoningAllowance: extra max_tokens for reasoning. noCloud: conversation IDs never sent to any model."
 }

@@ -42,6 +42,11 @@ function renderConversation(block, ctx, { threads = 3, latest = 3, botGroups = 5
   }
   lines.push(`#### ${convLabel(conv, ctx.me)}${conv.external ? ' (external)' : ''}`);
   lines.push(`${compressed.stats.messagesIn} messages (${humans.length} from people, ${botCount} from bots), ${parents.size} active ${parents.size === 1 ? 'thread' : 'threads'}`);
+  // noCloud conversations are never sent to a model; the digest gives counts only.
+  if (conv.noCloud) {
+    lines.push('- Not summarized (on the noCloud list): counts only.');
+    return lines.join('\n');
+  }
 
   // Busiest threads in the window, named by their first message.
   const replyCounts = new Map();
@@ -81,6 +86,7 @@ function renderDigest({ units, window, footer, ctx, customerKey }) {
   const out = [];
   out.push(`# Slack digest, ${new Date(window.end * 1000).toLocaleString('en-CA', { dateStyle: 'medium', timeStyle: 'short' })}`);
   out.push(`Window: ${new Date(window.start * 1000).toLocaleString('en-CA', { dateStyle: 'medium', timeStyle: 'short' })} to now (${window.hours.toFixed(1)} h, ${window.reason}).`);
+  out.push(`Written by: ${ctx.writtenBy ?? 'code only (no model)'}.`);
   out.push('');
   out.push('_Code-only preview (phase 1). No model was used: this shows activity, thread starters, the latest messages and compressed bot posts, each with a link. Risk extraction comes in phase 2._');
   for (const u of units) {

@@ -24,12 +24,12 @@ A small service on the home-lab Mac mini that runs **named shell jobs on request
 | `scripts/` | Operator helpers | `install-agent.sh` installs a plist from `launchd/`; `llm-eval.js` checks the LLM prompt templates |
 | `src/slack.js` | Shared read-only Slack client and unit rules | Used by the measurement scripts and the digest; also decides which conversations are external (masked) |
 | `src/secrets.js` | Reads `~/.lab/<name>` with the mode-600 check | One secret check for every client |
-| `src/deepseek.js` | DeepSeek client (cloud model for the Slack digest) | No tools, JSON mode, thinking off by default, input cap, timeouts, retries, usage and cost; see `docs/slack-digest.md` |
-| `src/mask.js` | Masks emails, phones, long numbers, URLs with tokens and secrets | Applied to external conversations before any text goes to a model |
+| `src/openrouter.js` | OpenRouter client (cloud models for the Slack digest) | Primary and secondary model routes, each pinned to one provider; fallback in code; served-provider check; live prices; input, output and cost caps; see `docs/slack-digest.md` |
+| `src/mask.js` | Masks secrets (every conversation) and emails, phones, long numbers and URLs with tokens (external conversations) | Applied before any text goes to a model |
 | `src/digest/` | The daily Slack digest: `run.js` (entry point), `fetch.js`, `compress.js` (bot posts, in code), `render.js` | Phase 1 writes a code-only digest to `data/digests/`; see `docs/slack-digest.md` |
 | `scripts/slack-channels.js`, `scripts/slack-measure.js` | Slack measurement (terminal only) | Count how many tokens a daily Slack digest would read, to choose between the local and a cloud model. See `docs/slack-measurement.md` |
-| `scripts/deepseek-check.js` | Live check of the DeepSeek key and model id | Uses invented text only |
-| `scripts/digest-selftest.js` | Self-tests for masking, the DeepSeek guards and bot compression | Invented data, no network; run after changing any of them |
+| `scripts/model-check.js` | Live check of each model route: model, served provider, tokens, cost, JSON shape | Uses invented text only; `--dry-run` shows request bodies and live prices without calling |
+| `scripts/digest-selftest.js` | Self-tests for masking, the OpenRouter client (fallback, caps, guards) and bot compression | Invented data, no network; run after changing any of them |
 | `config/` | Settings that are not secrets | `slack-bus.example.json` is the template; the real `slack-bus.json` (Slack channel to business unit rules) is git-ignored |
 | `data/` | Runtime data (everything except `.gitkeep` is git-ignored) | Holds `dispatcher.db`, `slack-channels.json`, `slack-measure-<date>.json`, `digests/` (mode 600) and `digest-state.json` |
 | `docs/` | Detailed documentation | Architecture, operations, adding jobs, design decisions, Slack digest design |
@@ -54,4 +54,4 @@ curl -s -X POST -H "Authorization: Bearer $(cat ~/.lab/token)" localhost:8787/ru
 - **Why things are the way they are:** [docs/decisions.md](docs/decisions.md)
 
 ## Secrets
-All secrets live in `~/.lab/` (directory 700, files 600) and never in this repo: `token`, `healthcheck-url-<job>`, `slack-token` and `deepseek-key`.
+All secrets live in `~/.lab/` (directory 700, files 600) and never in this repo: `token`, `healthcheck-url-<job>`, `slack-token` and `openrouter-key`.

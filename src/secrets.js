@@ -1,5 +1,5 @@
 'use strict';
-// Reads a secret from ~/.lab/<name>. Shared by the Slack client and the DeepSeek client so every secret
+// Reads a secret from ~/.lab/<name>. Shared by the Slack client and the OpenRouter client so every secret
 // gets the same check: a regular file that nobody but this user can read (mode 600), and not empty.
 // The value is returned to the caller only; it is never printed or logged here.
 const fs = require('node:fs');

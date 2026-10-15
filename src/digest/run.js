@@ -11,6 +11,10 @@
 // stdout, the run row in data/dispatcher.db and data/digest-state.json hold counts and timestamps only.
 //
 // Usage: node src/digest/run.js [--hours N] [--record] [--scheduled]
+//        node src/digest/run.js --from <ISO time> --to <ISO time> [--mask-report]
+//   --from/--to    a fixed window (testing; never recorded as a success)
+//   --mask-report  no digest: print which masking pattern fired on which message (pattern name, conversation ID,
+//                  message timestamp), never any text
 const fs = require('node:fs');
 const path = require('node:path');
 const { parseArgs } = require('node:util');
@@ -18,7 +22,7 @@ const { ROOT, DATA_DIR, CHANNELS_FILE, createClient, loadConfig, placeChannel, l
 const { fetchConversation } = require('./fetch');
 const { compressBots } = require('./compress');
 const { renderDigest, convLabel } = require('./render');
-const { maskText, newCounts, MASK_TYPES } = require('../mask');
+const { maskText, maskSecrets, newCounts, MASK_TYPES } = require('../mask');
 
 const DIGEST_CONFIG = path.join(ROOT, 'config', 'slack-digest.json');
 const STATE_FILE = path.join(DATA_DIR, 'digest-state.json');
@@ -39,6 +43,8 @@ function loadDigestConfig() {
     unitOrder: Array.isArray(c.unitOrder) ? c.unitOrder : [],
     customerGroup: c.customerGroup ?? null, // { bu, sub }: shown first, quiet ones named
     myName: c.myName ?? null,               // left out of group DM labels
+    // Conversation IDs never sent to any model; the digest shows them as "not summarized" with counts only.
+    noCloud: new Set(Array.isArray(c.noCloud) ? c.noCloud : []),
   };
 }
 
@@ -58,13 +64,18 @@ function readState() {
   const startedAt = new Date(started).toISOString();
   const { values: opts } = parseArgs({ options: {
     hours: { type: 'string' },
+    from: { type: 'string' },
+    to: { type: 'string' },
+    'mask-report': { type: 'boolean', default: false },
     record: { type: 'boolean', default: false },
     scheduled: { type: 'boolean', default: false },
   } });
   const source = opts.scheduled ? 'launchd-direct' : 'manual';
-  const record = opts.record || opts.scheduled;
+  const fixedWindow = Boolean(opts.from || opts.to);
+  const record = (opts.record || opts.scheduled) && !fixedWindow && !opts['mask-report'];
   const { logRun } = require('../db');
-  const summary = { phase: 1, modelCalls: 0 };
+  // servedBy names the model and provider that wrote the digest; phase 1 is code only.
+  const summary = { phase: 1, modelCalls: 0, servedBy: 'code only (no model)' };
   const finish = (status, exitCode) => {
     summary.runtimeS = Math.round((Date.now() - started) / 1000);
     logRun({ job: 'slack-digest', source, startedAt, durationMs: Date.now() - started, exitCode, status, output: JSON.stringify(summary) });
@@ -87,9 +98,17 @@ function readState() {
     // Window
     const now = Math.floor(Date.now() / 1000);
     let windowStart;
+    let windowEnd = now;
     let reason;
     const state = readState();
-    if (opts.hours) {
+    if (fixedWindow) {
+      windowStart = Math.floor(Date.parse(opts.from ?? '') / 1000);
+      windowEnd = Math.floor(Date.parse(opts.to ?? '') / 1000);
+      if (!(windowStart < windowEnd) || windowEnd - windowStart > cfg.maxWindowHours * 3600) {
+        throw new Error(`--from and --to must both be valid times, --from first, at most ${cfg.maxWindowHours} h apart`);
+      }
+      reason = 'fixed --from/--to';
+    } else if (opts.hours) {
       const h = Number(opts.hours);
       if (!(h > 0 && h <= cfg.maxWindowHours)) throw new Error(`--hours must be between 0 and ${cfg.maxWindowHours}`);
       windowStart = now - h * 3600;
@@ -102,7 +121,7 @@ function readState() {
       windowStart = now - cfg.defaultWindowHours * 3600;
       reason = `no recorded run; last ${cfg.defaultWindowHours} h`;
     }
-    const window = { start: windowStart, end: now, hours: (now - windowStart) / 3600, reason };
+    const window = { start: windowStart, end: windowEnd, hours: (windowEnd - windowStart) / 3600, reason };
     const lookbackStart = windowStart - cfg.threadLookbackDays * 86_400;
     Object.assign(summary, { windowHours: Number(window.hours.toFixed(2)), conversations: targets.length });
 
@@ -110,15 +129,17 @@ function readState() {
     process.stderr.write('Loading user names...\n');
     const users = await slack.paginate('users.list', { limit: '200' }, 'members');
     const names = new Map(users.map((u) => [u.id, u.profile?.display_name || u.real_name || u.name]));
-    const ctx = { workspaceUrl: cfg.workspaceUrl, me: cfg.myName, nameOf: (id) => (id ? names.get(id) ?? id : 'someone') };
+    const ctx = { workspaceUrl: cfg.workspaceUrl, me: cfg.myName, writtenBy: summary.servedBy, nameOf: (id) => (id ? names.get(id) ?? id : 'someone') };
 
     // Fetch and compress, one conversation at a time (the Slack client spaces calls per method).
     const blocks = [];
     const maskCounts = newCounts();
-    const totals = { messages: 0, botMessages: 0, charsIn: 0, charsOut: 0, wouldSendChars: 0, errors: 0, activeConversations: 0, externalConversations: 0 };
+    const totals = { messages: 0, botMessages: 0, charsIn: 0, charsOut: 0, wouldSendChars: 0, errors: 0, activeConversations: 0, externalConversations: 0, noCloudConversations: 0 };
+    const secretHits = []; // for --mask-report: { pattern, conv, ts }, never text
     for (const [i, conv] of targets.entries()) {
       process.stderr.write(`  [${i + 1}/${targets.length}] ${convLabel(conv, cfg.myName)}\n`);
-      const r = await fetchConversation(slack, conv, { windowStart, windowEnd: now + 1, lookbackStart });
+      conv.noCloud = cfg.noCloud.has(conv.id);
+      const r = await fetchConversation(slack, conv, { windowStart, windowEnd: windowEnd + 1, lookbackStart });
       if (r.error) { totals.errors++; blocks.push({ conv, error: r.error }); continue; }
       const compressed = compressBots(r.messages);
       totals.messages += compressed.stats.messagesIn;
@@ -126,12 +147,35 @@ function readState() {
       totals.charsIn += compressed.stats.charsIn;
       totals.charsOut += compressed.stats.charsOut;
       if (compressed.stats.messagesIn) totals.activeConversations++;
-      // What phase 2 would send: people's messages and the kept bot lines, masked if the conversation is external.
-      // Measured here and thrown away; nothing is sent (phase 1 makes no model calls).
-      const wouldSend = [...compressed.humans, ...compressed.botGroups.flatMap((g) => [...g.examples, ...g.alerts])];
-      for (const m of wouldSend) totals.wouldSendChars += (conv.external ? maskText(m.text, maskCounts) : m.text).length;
+      // What phase 2 would send: people's messages and the kept bot lines. Secrets are masked in every conversation;
+      // external conversations get the full masking. Measured here and thrown away; nothing is sent (phase 1 makes
+      // no model calls). noCloud conversations are never sent, so they are not measured either.
+      if (conv.noCloud) {
+        if (compressed.stats.messagesIn) totals.noCloudConversations++;
+      } else {
+        const wouldSend = [...compressed.humans, ...compressed.botGroups.flatMap((g) => [...g.examples, ...g.alerts])];
+        for (const m of wouldSend) {
+          const onHit = (type, pattern) => { if (type === 'secret') secretHits.push({ pattern, conv: conv.id, ts: m.ts }); };
+          totals.wouldSendChars += (conv.external ? maskText(m.text, maskCounts, onHit) : maskSecrets(m.text, maskCounts, onHit)).length;
+        }
+      }
       if (conv.external && compressed.stats.messagesIn) totals.externalConversations++;
       blocks.push({ conv, compressed, parents: r.parents, error: null });
+    }
+
+    if (opts['mask-report']) {
+      // Pattern names, conversation IDs and message timestamps only; never text, and no digest is written.
+      clearTimeout(deadline);
+      Object.assign(summary, { maskReport: true, masked: maskCounts, secretHits: secretHits.length, apiCalls: slack.stats.calls });
+      finish('mask-report', 0);
+      console.log(`Mask report for ${new Date(windowStart * 1000).toISOString()} to ${new Date(windowEnd * 1000).toISOString()}: ${totals.messages} messages in ${targets.length} conversations.`);
+      console.log(`Counts by type: ${MASK_TYPES.map((t) => `${t} ${maskCounts[t]}`).join(', ')}`);
+      console.log(`Secret hits (${secretHits.length}):`);
+      for (const h of secretHits) {
+        const c = targets.find((t) => t.id === h.conv);
+        console.log(`  pattern ${h.pattern.padEnd(12)} conversation ${h.conv} (${c?.external ? 'external' : 'internal'}) message ts ${h.ts}`);
+      }
+      return;
     }
 
     // Arrange by unit and sub-group: configured unit order, customers first inside their unit.
@@ -169,7 +213,8 @@ function readState() {
       `- Conversations: ${targets.length} mapped, ${totals.activeConversations} active (${totals.externalConversations} of them external), ${totals.errors} unreadable.`,
       `- Messages: ${totals.messages} (${totals.botMessages} from bots). Characters ${totals.charsIn.toLocaleString('en-US')} → ${totals.charsOut.toLocaleString('en-US')} after bot compression (${summary.compressionRatio === null ? '-' : Math.round(summary.compressionRatio * 100)}%).`,
       `- Would send to a model (phase 2): about ${wouldSendTokens.toLocaleString('en-US')} tokens before prompts; cap ${cfg.maxInputTokens.toLocaleString('en-US')}${summary.underCap ? '' : ' (OVER CAP: the run would abort)'}.`,
-      `- Masking dry run on external conversations: ${MASK_TYPES.map((t) => `${t} ${maskCounts[t]}`).join(', ')}. Nothing was sent.`,
+      `- Masking dry run (secrets in every conversation, the rest in external ones): ${MASK_TYPES.map((t) => `${t} ${maskCounts[t]}`).join(', ')}. Nothing was sent.`,
+      `- Not sent to any model by choice (noCloud): ${totals.noCloudConversations} active ${totals.noCloudConversations === 1 ? 'conversation' : 'conversations'}.`,
       `- Slack API calls: ${s.calls}, rate-limit waits: ${s.rateLimited}. Model calls: 0. Runtime: ${Math.round((Date.now() - started) / 1000)} s.`,
     ];
     const text = renderDigest({ units, window, footer, ctx, customerKey: cg });
