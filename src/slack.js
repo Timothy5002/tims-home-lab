@@ -1,11 +1,12 @@
 'use strict';
-// Shared code for the Slack measurement scripts (slack-channels.js, slack-measure.js).
-// It reads the Slack token, talks to Slack's read-only Web API methods with rate limiting, and maps
-// channels to business units using config/slack-bus.json. It never writes to Slack and never logs
-// the token or message text. See docs/slack-measurement.md.
+// Shared Slack code for the measurement scripts and the daily digest (src/digest/).
+// It reads the Slack token, talks to Slack's read-only Web API methods with rate limiting, maps
+// conversations to business units using config/slack-bus.json, and decides which conversations are
+// external (masked before any model call). It never writes to Slack and never logs the token or
+// message text. See docs/slack-measurement.md and docs/slack-digest-design.md.
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
+const { readSecret } = require('./secrets');
 
 const ROOT = path.join(__dirname, '..');
 const DATA_DIR = path.join(ROOT, 'data');
@@ -13,15 +14,22 @@ const CHANNELS_FILE = path.join(DATA_DIR, 'slack-channels.json');
 const CONFIG_FILE = path.join(ROOT, 'config', 'slack-bus.json');
 const EXAMPLE_CONFIG_FILE = path.join(ROOT, 'config', 'slack-bus.example.json');
 
-// Same check as src/schedule-run.js: the file must be a regular file nobody else can read.
-function readSecret(name) {
-  const file = path.join(os.homedir(), '.lab', name);
-  const st = fs.statSync(file);
-  if (!st.isFile() || (st.mode & 0o077) !== 0) throw new Error(`${file} must be a regular file with mode 600`);
-  const v = fs.readFileSync(file, 'utf8').trim();
-  if (!v) throw new Error(`${file} is empty`);
-  return v;
+// Housekeeping events nobody would read in a digest; skipped when measuring and when fetching.
+const SKIP_SUBTYPES = new Set([
+  'channel_join', 'channel_leave', 'channel_topic', 'channel_purpose', 'channel_name', 'channel_archive',
+  'channel_unarchive', 'channel_convert_to_private', 'channel_convert_to_public', 'group_join', 'group_leave',
+  'group_topic', 'group_purpose', 'group_name', 'group_archive', 'group_unarchive', 'pinned_item', 'unpinned_item',
+  'bot_add', 'bot_remove', 'tombstone', 'joiner_notification', 'reminder_add',
+]);
+
+// Text a reader (or a model) would see: the message text plus legacy attachment text, where many bots post.
+function messageText(m) {
+  const parts = [m.text ?? ''];
+  for (const a of m.attachments ?? []) parts.push(a.pretext, a.title, a.text);
+  return parts.filter(Boolean).join('\n');
 }
+
+const isBot = (m) => Boolean(m.bot_id) || m.subtype === 'bot_message';
 
 // The only Slack methods these scripts may call, all read-only, with the gap kept between calls.
 // Slack's published limits: Tier 2 is about 20/min, Tier 3 about 50/min, Tier 4 about 100/min.
@@ -111,6 +119,9 @@ function createClient() {
 //   groupDms:  { "<group DM id>": { bu, sub?, label?, members? } }  group DMs are only included if listed here;
 //              members (full names, you included) is the set the ID was matched on, and is re-checked on every run.
 //   pendingGroupDms: [{ label, bu, sub?, candidates: [ids], note? }]  not matched; listed in the report until decided.
+//   external:  { units: [bu, ...], internalPrefixes: [prefix, ...] }  which conversations count as external
+//              (masked before any model call): a conversation in one of these units whose name does not start
+//              with an internal prefix. Slack's own is_ext_shared flag also makes a conversation external.
 // Matching is case-insensitive. Keys starting with "_" are comments.
 const globToRegex = (g) => new RegExp(`^${g.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*')}$`, 'i');
 
@@ -162,17 +173,36 @@ function loadConfig() {
   if (!Array.isArray(pendingGroupDms) || !pendingGroupDms.every((p) => p && typeof p.label === 'string' && Array.isArray(p.candidates))) {
     bad('"pendingGroupDms" must be a list of { label, bu, sub?, candidates: [ids], note? }');
   }
-  return { rules: compiled, overrides, groupDms, pendingGroupDms };
+  const ext = cfg.external ?? {};
+  const strList = (v, what) => {
+    if (v === undefined) return [];
+    if (!Array.isArray(v) || !v.every((x) => typeof x === 'string' && x)) bad(`"external.${what}" must be a list of names`);
+    return v;
+  };
+  const external = { units: strList(ext.units, 'units'), internalPrefixes: strList(ext.internalPrefixes, 'internalPrefixes') };
+  return { rules: compiled, overrides, groupDms, pendingGroupDms, external };
 }
 
 // "BU > sub-group", or just "BU".
 const groupName = (t) => (t.sub ? `${t.bu} > ${t.sub}` : t.bu);
 const sameSet = (a, b) => a.length === b.length && [...a].sort().every((x, i) => x === [...b].sort()[i]);
 
-// Returns { bu, sub, group, by, matches, memberDrift }. by is how it was placed: override, rule, group-dm,
+// Why a conversation is external (empty list = internal). Derived from the config and the listing, never stored
+// by hand. Rule 1: it is in an external unit and its name lacks an internal prefix (group DMs included).
+// Rule 2: Slack marks it as shared with another organization (only in listings made after this field was saved).
+function externalReasons(cfg, ch, bu) {
+  const why = [];
+  if (bu && cfg.external.units.includes(bu) && !cfg.external.internalPrefixes.some((p) => ch.name.toLowerCase().startsWith(p.toLowerCase()))) {
+    why.push('unit rule');
+  }
+  if (ch.isExtShared === true) why.push('Slack shared');
+  return why;
+}
+
+// Returns { bu, sub, group, by, matches, memberDrift, external, externalWhy }. by is how it was placed: override, rule, group-dm,
 // excluded, or null if unplaced. matches lists every rule that matched a channel (more than one is an overlap).
 // memberDrift is true when a listed group DM's current members differ from the members recorded in the config.
-function placeChannel(cfg, ch) {
+function placeChannelBase(cfg, ch) {
   const none = { bu: null, sub: null, group: null, by: null, matches: [] };
   const matches = ch.type === 'group_dm' ? [] : cfg.rules.filter((r) => r.test(ch.name)).map((r) => ({ label: r.label, group: groupName(r) }));
   if (Object.hasOwn(cfg.overrides, ch.id)) {
@@ -188,6 +218,18 @@ function placeChannel(cfg, ch) {
   if (!matches.length) return none;
   const first = cfg.rules.find((r) => r.test(ch.name));
   return { bu: first.bu, sub: first.sub, group: groupName(first), by: 'rule', matches };
+}
+
+function placeChannel(cfg, ch) {
+  const p = placeChannelBase(cfg, ch);
+  const externalWhy = externalReasons(cfg, ch, p.bu);
+  return { ...p, external: externalWhy.length > 0, externalWhy };
+}
+
+// Link to a message, built in code (never by a model). Thread replies need the parent and channel too.
+function permalink(workspaceUrl, channel, ts, threadTs) {
+  const base = `${workspaceUrl.replace(/\/+$/, '')}/archives/${channel}/p${String(ts).replace('.', '')}`;
+  return threadTs && threadTs !== ts ? `${base}?thread_ts=${threadTs}&cid=${channel}` : base;
 }
 
 // Writes JSON readable only by this user (the files hold channel names and member names).
@@ -217,6 +259,6 @@ function printTable(header, rows) {
 }
 
 module.exports = {
-  ROOT, DATA_DIR, CHANNELS_FILE, CONFIG_FILE,
+  ROOT, DATA_DIR, CHANNELS_FILE, CONFIG_FILE, SKIP_SUBTYPES, messageText, isBot, permalink, readSecret,
   createClient, SlackError, loadConfig, placeChannel, groupName, writePrivateJson, localDay, fmtInt, printTable, sleep,
 };

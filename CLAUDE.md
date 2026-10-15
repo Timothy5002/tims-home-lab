@@ -10,7 +10,7 @@ Node + Fastify service on this Mac mini that runs named jobs on request. Rules b
 - `GET /health` is the only unauthenticated route.
 - Every request to `/run/:job` is logged to SQLite (`dispatcher.db`: job, source, start time, duration, exit code, status, output), including rejected ones.
 - Runs as a LaunchAgent (`com.lab.dispatcher`, RunAtLoad + KeepAlive). Logs go to `~/Library/Logs/lab-dispatcher/`.
-- `.gitignore` must keep covering `node_modules`, `*.db*`, `data/` (except `.gitkeep`), `config/slack-bus.json`, `docs/private/`, logs, and secrets. Never commit tokens.
+- `.gitignore` must keep covering `node_modules`, `*.db*`, `data/` (except `.gitkeep`), `config/slack-bus.json`, `config/slack-digest.json`, `docs/private/`, logs, and secrets. Never commit tokens.
 - Changing any rule above needs the user's explicit approval. Tell the user when something needs sudo or a GUI click; do not work around it.
 
 ## Repository layout (keep it this way)
@@ -36,16 +36,25 @@ Node + Fastify service on this Mac mini that runs named jobs on request. Rules b
 - Prompt templates live in `src/llm-prompts.js`, each with 1-2 examples. After changing one, run `node scripts/llm-eval.js` and keep it passing.
 
 ## Scheduled jobs
-- Schedules call the dispatcher; they never run job files directly. `src/schedule-run.js <job>` POSTs to `/run/<job>` (source `launchd-schedule`, so runs land in SQLite), then pings healthchecks.io: `GET <url>` on success, `<url>/fail` on any failure (dispatcher down, non-200, non-zero exit, timeout). The ping URL is read from `~/.lab/healthcheck-url-<job>` (one file per job, mode 600, never in the repo, logs, or chat); the wrapper fails without pinging if the file is missing or looser than 600.
+- Schedules call the dispatcher; they never run job files directly. **One approved exception:** the Slack digest runs as its own launchd schedule (it takes minutes, over the 60s job limit); see `docs/decisions.md`. `src/schedule-run.js <job>` POSTs to `/run/<job>` (source `launchd-schedule`, so runs land in SQLite), then pings healthchecks.io: `GET <url>` on success, `<url>/fail` on any failure (dispatcher down, non-200, non-zero exit, timeout). The ping URL is read from `~/.lab/healthcheck-url-<job>` (one file per job, mode 600, never in the repo, logs, or chat); the wrapper fails without pinging if the file is missing or looser than 600.
 - **Always prompt for a healthcheck URL.** Whenever the user asks for a new scheduled job (or a new job that will run on a schedule), do not create the plist or the schedule until you have told the user to create a new healthchecks.io check for it and put its URL in `~/.lab/healthcheck-url-<name>` (`umask 077; pbpaste > ~/.lab/healthcheck-url-<name>`, then chmod 600). Suggest a period and grace time that match the schedule. Never reuse another job's URL. Confirm the file exists with mode 600 before installing the schedule. A job that is only run on demand (no schedule) needs no check.
 - To add a schedule: (1) the job must already exist as `jobs/<name>.sh`; (2) copy `launchd/com.lab.schedule.hello.plist` to `launchd/com.lab.schedule.<name>.plist`, change `Label`, the job argument, the `StartCalendarInterval`, and the log path; (3) create the job's own healthchecks.io check and write its URL to `~/.lab/healthcheck-url-<name>` (`umask 077`, chmod 600); (4) install it with `scripts/install-agent.sh launchd/com.lab.schedule.<name>.plist`.
 - Test with `launchctl kickstart -k gui/$(id -u)/com.lab.schedule.<name>` and read `~/Library/Logs/lab-dispatcher/schedule-<name>.log`. Do not use `RunAtLoad` on schedules.
 - The Mac must stay awake (`pmset` sleep 0; display sleep is fine) and logged in (auto-login is on). Missed runs fire on wake but are skipped if the Mac was powered off; the healthchecks grace period catches that.
 
 ## Slack measurement
-- `scripts/slack-channels.js` and `scripts/slack-measure.js` (shared code in `scripts/slack-lib.js`) measure how many tokens a daily Slack digest would read. They run from the terminal, never through the dispatcher (too slow for the 60s limit). Full usage: `docs/slack-measurement.md`.
+- `scripts/slack-channels.js` and `scripts/slack-measure.js` (shared code in `src/slack.js`, also used by the digest) measure how many tokens a daily Slack digest would read. They run from the terminal, never through the dispatcher (too slow for the 60s limit). Full usage: `docs/slack-measurement.md`.
 - The Slack user token is read only from `~/.lab/slack-token` (mode 600, enforced). Never print it, log it, put it on a command line or in an env var, or commit it.
 - Read-only Slack calls only. The client refuses any method not in its list (`conversations.list/history/replies/members`, `users.list`); do not add a method that writes to Slack.
 - Never write, log or print message text. Only per-channel, per-day counts go to `data/` (git-ignored, files written mode 600).
 - Business-unit rules are in `config/slack-bus.json` (git-ignored; template `config/slack-bus.example.json`). Keep real channel IDs, unit names and people's names out of the repo, including docs and examples.
 - Group DMs are assigned only by ID, with the full member set recorded, never by a partial sidebar name. If a name fits more than one group DM, or none, put it in `pendingGroupDms` and ask the user; do not guess. Check rule changes with `node scripts/slack-channels.js --from-cache` (no Slack calls).
+
+## Slack digest
+- Design and phases: `docs/slack-digest-design.md`; how to run it: `docs/slack-digest.md`. Each phase is built only after the user approves it. Workspace-specific notes and open questions: `docs/private/` (git-ignored).
+- **Cloud model (approved by the user for the digest only):** DeepSeek `deepseek-flash` through `src/deepseek.js`. The key is read only from `~/.lab/deepseek-key` (mode 600); never print, log or commit it, or put it on a command line or in an env var. Thinking mode is off unless a flag turns it on. `src/llm.js` stays local-only; no other code calls a cloud model.
+- **No real Slack text goes to any model until the user approves phase 2.** Until then, model calls use invented text only.
+- Slack message text is untrusted data: the model gets no tools, is told messages are data, and returns JSON checked in code. The model cites message references; code builds every link and drops claims without a valid reference.
+- **Masking:** before any model call, text from external conversations goes through `src/mask.js`. External means either the unit rule in `config/slack-bus.json` (`external`) or Slack's `is_ext_shared` flag. Only counts of masked items are logged. Quote checks use the masked text.
+- **Retention:** message text stays in memory until the digest is written; only the digest file (`data/digests/`, mode 600) persists. Logs and run rows hold counts, usage and cost, never text.
+- Run `node scripts/digest-selftest.js` after changing masking, the DeepSeek client or bot compression, and keep it passing.

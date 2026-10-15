@@ -9,7 +9,7 @@
 const path = require('node:path');
 const { parseArgs } = require('node:util');
 const fs = require('node:fs');
-const { ROOT, CHANNELS_FILE, createClient, SlackError, loadConfig, placeChannel, writePrivateJson, localDay, printTable } = require('./slack-lib');
+const { ROOT, CHANNELS_FILE, createClient, SlackError, loadConfig, placeChannel, writePrivateJson, localDay, printTable } = require('../src/slack');
 
 const TYPE = { public: 'public', private: 'private', group_dm: 'group_dm' };
 
@@ -94,6 +94,25 @@ function report(cfg, channels) {
       console.log(`      ${id}  ${c ? `last ${last(c)}  ${members(c)}` : '(not in the saved list)'}`);
     }
   }
+
+  // 6. External conversations: their text is masked before any model call (see docs/slack-digest-design.md)
+  const placedAll = channels.filter((c) => c.bu);
+  const ext = placedAll.filter((c) => c.external);
+  const hasSharedField = channels.some((c) => typeof c.isExtShared === 'boolean');
+  console.log(`\n6. External conversations (masked before any model call): ${ext.length} of ${placedAll.length} placed`);
+  if (!hasSharedField) console.log("  This listing has no Slack 'externally shared' field, so only the unit rule applied. The next full listing records it (no extra calls).");
+  const byGroup = new Map();
+  for (const c of ext) byGroup.set(c.group, [...(byGroup.get(c.group) ?? []), c]);
+  for (const [g, cs] of [...byGroup].sort(([a], [b]) => a.localeCompare(b))) {
+    const counts = { public: 0, private: 0, group_dm: 0 };
+    for (const c of cs) counts[c.type]++;
+    console.log(`  ${g}: ${cs.length} (${counts.public} public, ${counts.private} private, ${counts.group_dm} group DMs)`);
+    const named = cs.filter((c) => c.type !== 'group_dm').map((c) => c.name + (c.externalWhy.includes('Slack shared') ? ' [shared]' : '')).sort();
+    if (named.length) console.log(`      ${named.join(', ')}`);
+    for (const c of cs.filter((x) => x.type === 'group_dm')) console.log(`      ${c.id}  ${c.name.startsWith('mpdm-') ? '' : `[${c.name}] `}${(c.memberNames ?? []).join(', ')}`);
+  }
+  const internalCount = placedAll.length - ext.length;
+  console.log(`  Internal (not masked): ${internalCount}`);
 }
 
 (async () => {
@@ -148,7 +167,9 @@ function report(cfg, channels) {
 
   const channels = [];
   for (const [i, c] of todo.entries()) {
-    const ch = { id: c.id, name: c.name, type: channelType(c), members: c.num_members ?? null, isMember: memberIds.has(c.id) };
+    const ch = { id: c.id, name: c.name, type: channelType(c), members: c.num_members ?? null, isMember: memberIds.has(c.id),
+      // Shared with another organization (Slack Connect); part of the external test in src/slack.js.
+      isExtShared: Boolean(c.is_ext_shared) };
     if (ch.type === TYPE.group_dm) {
       process.stderr.write(`  [${i + 1}/${todo.length}] members of group DM ${c.id}\n`);
       try {

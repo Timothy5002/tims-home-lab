@@ -1,0 +1,9 @@
+{
+  "_comment": "Example only. Copy to config/slack-digest.json (git-ignored). See docs/slack-digest.md.",
+  "workspaceUrl": "https://your-workspace.slack.com",
+  "threadLookbackDays": 14,
+  "maxWindowHours": 72,
+  "defaultWindowHours": 24,
+  "maxInputTokens": 122000,
+  "runDeadlineMinutes": 25
+}

@@ -16,7 +16,8 @@ Optional, for jobs that use the LLM helper: Ollama from Homebrew (`brew services
 |---|---|
 | `~/.lab/token` | API bearer token (600) |
 | `~/.lab/healthcheck-url-<job>` | healthchecks.io ping URL for that job's schedule (600) |
-| `~/.lab/slack-token` | Read-only Slack user token for the Slack measurement scripts (600) |
+| `~/.lab/slack-token` | Read-only Slack user token for the Slack measurement scripts and the digest (600) |
+| `~/.lab/deepseek-key` | DeepSeek API key for the Slack digest (600) |
 | `~/Library/LaunchAgents/com.lab.*.plist` | Installed copies of `launchd/*.plist` |
 | `~/Library/Logs/lab-dispatcher/` | `out.log`, `err.log` (service), `schedule-<job>.log` (scheduled runs) |
 

@@ -10,7 +10,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { parseArgs } = require('node:util');
-const { ROOT, DATA_DIR, CHANNELS_FILE, createClient, SlackError, loadConfig, placeChannel, writePrivateJson, localDay, fmtInt, printTable } = require('./slack-lib');
+const { ROOT, DATA_DIR, CHANNELS_FILE, SKIP_SUBTYPES, createClient, SlackError, loadConfig, placeChannel, writePrivateJson, localDay, fmtInt, printTable } = require('../src/slack');
 
 const CHARS_PER_TOKEN = 4;
 const LOCAL_IN_TPS = 65;      // qwen2.5:7b on this Mac, reading
@@ -19,13 +19,6 @@ const LOCAL_CHUNK_CHARS = 8000; // src/llm.js input cap
 const UNASSIGNED = 'Unassigned DMs';
 const UNASSIGNED_ACTIVE_DAYS = 30; // same test as section 4 of the slack-channels.js report
 
-// Housekeeping events a digest would not read.
-const SKIP_SUBTYPES = new Set([
-  'channel_join', 'channel_leave', 'channel_topic', 'channel_purpose', 'channel_name', 'channel_archive',
-  'channel_unarchive', 'channel_convert_to_private', 'channel_convert_to_public', 'group_join', 'group_leave',
-  'group_topic', 'group_purpose', 'group_name', 'group_archive', 'group_unarchive', 'pinned_item', 'unpinned_item',
-  'bot_add', 'bot_remove', 'tombstone', 'joiner_notification', 'reminder_add',
-]);
 
 function usage(msg) {
   console.error(`slack-measure: ${msg}`);

@@ -6,7 +6,7 @@ They run from the terminal, not through the dispatcher, because reading a week o
 
 ## Before you start
 - The Slack **user** token lives in `~/.lab/slack-token` (mode 600). The scripts refuse to run if the file is readable by anyone else. Never paste it anywhere else.
-- The token's scopes are read-only: `channels:read`, `channels:history`, `groups:read`, `groups:history`, `mpim:read`, `mpim:history`, `users:read`. The scripts can only call `conversations.list`, `conversations.history`, `conversations.replies`, `conversations.members` and `users.list`; any other method is refused in code (`scripts/slack-lib.js`).
+- The token's scopes are read-only: `channels:read`, `channels:history`, `groups:read`, `groups:history`, `mpim:read`, `mpim:history`, `users:read`. The scripts can only call `conversations.list`, `conversations.history`, `conversations.replies`, `conversations.members` and `users.list`; any other method is refused in code (`src/slack.js`, shared with the Slack digest).
 
 ## Step 1: list channels
 ```bash
@@ -27,6 +27,9 @@ For each kept conversation it records the ID, name, type, member count and last 
 3. channels still unplaced, busiest first
 4. group DMs active in the last 30 days that are not assigned, with their full member names
 5. group DMs from the config that are not matched: an ID that is no longer in the saved list, a group DM whose members changed, and every entry in `pendingGroupDms` with its candidates
+6. external conversations (masked before the digest sends anything to a model), by unit and sub-group; see [slack-digest.md](slack-digest.md)
+
+The listing also records whether Slack marks each conversation as shared with another organization (`isExtShared`), which is part of the external test.
 
 Members whose user ID could not be resolved to a name (usually people from another workspace, whom `users.list` does not return) show as raw IDs like `U0123ABCD`. For those group DMs the report adds the handles from the group DM's internal name (`mpdm-alex--sam-1`), which usually identify them.
 

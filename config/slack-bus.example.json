@@ -1,19 +1,65 @@
 {
   "_comment": "Example only. Copy to config/slack-bus.json (git-ignored) and put the real rules there. Format: docs/slack-measurement.md. Check with: node scripts/slack-channels.js --from-cache",
   "rules": [
-    { "bu": "Unit A", "name": ["unit-a-general", "unit-a-ops"] },
-    { "bu": "Unit B", "sub": "Customers", "prefix": "cust-" },
-    { "bu": "Unit B", "sub": "Customers", "glob": "*-coordination*" },
-    { "bu": "Unit B", "sub": "Internal", "regex": "^(team|staff)-" }
+    {
+      "bu": "Unit A",
+      "name": [
+        "unit-a-general",
+        "unit-a-ops"
+      ]
+    },
+    {
+      "bu": "Unit B",
+      "sub": "Customers",
+      "prefix": "cust-"
+    },
+    {
+      "bu": "Unit B",
+      "sub": "Customers",
+      "glob": "*-coordination*"
+    },
+    {
+      "bu": "Unit B",
+      "sub": "Internal",
+      "regex": "^(team|staff)-"
+    }
   ],
   "overrides": {
-    "C0000000001": { "bu": "Unit A" },
+    "C0000000001": {
+      "bu": "Unit A"
+    },
     "C0000000002": null
   },
   "groupDms": {
-    "C0000000003": { "bu": "Unit B", "sub": "Internal", "label": "Alex, Sam", "members": ["Alex", "Sam", "You"] }
+    "C0000000003": {
+      "bu": "Unit B",
+      "sub": "Internal",
+      "label": "Alex, Sam",
+      "members": [
+        "Alex",
+        "Sam",
+        "You"
+      ]
+    }
   },
   "pendingGroupDms": [
-    { "label": "Alex, Jordan...", "bu": "Unit A", "candidates": ["C0000000004", "C0000000005"], "note": "two group DMs fit; pick one" }
-  ]
+    {
+      "label": "Alex, Jordan...",
+      "bu": "Unit A",
+      "candidates": [
+        "C0000000004",
+        "C0000000005"
+      ],
+      "note": "two group DMs fit; pick one"
+    }
+  ],
+  "external": {
+    "units": [
+      "Unit B"
+    ],
+    "internalPrefixes": [
+      "success-"
+    ]
+  },
+  "_external": "Conversations in these units are external (masked before any model call) unless their name starts with an internal prefix. Slack-shared conversations are always external."
 }
