@@ -13,29 +13,42 @@ They run from the terminal, not through the dispatcher, because reading a week o
 node scripts/slack-channels.js            # conversations you are a member of
 node scripts/slack-channels.js --all      # also public channels you are not in (much slower)
 node scripts/slack-channels.js --no-activity   # skip the "last activity" lookup
+node scripts/slack-channels.js --from-cache    # no Slack calls: re-apply the rules to the saved list (use after editing them)
 ```
 It asks Slack for every public channel, private channel and group DM the token can see (archived ones excluded). By default it then keeps only the ones the token's user is a **member of**, using the `is_member` field from that same list, so the filter costs no extra calls. Public channels you are not in are usually not digest material, and skipping them saves one call each. `--all` keeps them.
 
 For each kept conversation it records the ID, name, type, member count and last activity, plus member names for group DMs. It saves this to `data/slack-channels.json` (git-ignored, mode 600) and prints:
 - conversations seen vs member of, per type (public, private, group DM)
-- channel counts per business unit
-- channels it could not place (sorted by last activity, so the busy ones come first)
-- group DMs that are not included, with their members, so you can pick the ones that matter
+- the report below
+
+`--from-cache` prints only the report, from the saved list, without touching Slack or the token. The report has five sections:
+1. conversations matched per business unit and sub-group
+2. channels matched by more than one rule, with every rule that matched and which one won, marked `[DIFFERENT targets]` when the rules disagree
+3. channels still unplaced, busiest first
+4. group DMs active in the last 30 days that are not assigned, with their full member names
+5. group DMs from the config that are not matched: an ID that is no longer in the saved list, a group DM whose members changed, and every entry in `pendingGroupDms` with its candidates
+
+Members whose user ID could not be resolved to a name (usually people from another workspace, whom `users.list` does not return) show as raw IDs like `U0123ABCD`. For those group DMs the report adds the handles from the group DM's internal name (`mpdm-alex--sam-1`), which usually identify them.
 
 Last activity costs one API call per conversation, and each group DM needs one more call for its members, so with a few hundred conversations this step takes 10 to 15 minutes. `--no-activity` skips the last-activity call. `slack-measure.js` only measures conversations in this saved list, so a channel left out here (for example a public channel you are not in, without `--all`) is not measured even if a rule matches it.
 
 ## Step 2: write the business-unit rules
-Copy the example and edit it (the real file is git-ignored because channel IDs and unit names are private):
+Copy the example and edit it (the real file is git-ignored because channel IDs, unit names and member names are private):
 ```bash
 cp config/slack-bus.example.json config/slack-bus.json
 ```
+Units have two levels: a business unit (`bu`) and an optional sub-group (`sub`). Reports show each business unit with its sub-groups under it.
+
 | Key | Meaning |
 |---|---|
-| `rules` | List of `{ "bu": "<unit>", "prefix": "<text>" }` or `{ "bu": "<unit>", "regex": "<pattern>" }`. Applies to public and private channels; first match wins; case-insensitive. |
-| `overrides` | `{ "<channel ID>": "<unit>" }`. Beats the rules. A value of `null` leaves the channel out on purpose (it stops showing up as unplaced). |
-| `groupDms` | `{ "<group DM ID>": "<unit>" }`. Group DMs are measured **only** if listed here. |
+| `rules` | Ordered list for public and private channels. Each rule has `bu`, optional `sub`, and exactly one of: `name` (an exact channel name, or a list of them), `prefix`, `glob` (`*` means "anything" and the pattern must match the whole name, so `*-coordination*` matches `acme-coordination`) or `regex`. All are case-insensitive. **The first matching rule wins**, so put exact names before broad prefixes and patterns. |
+| `overrides` | `{ "<channel ID>": { "bu": "...", "sub": "..." } }`. Beats every rule. A value of `null` leaves the channel out on purpose (it stops showing up as unplaced). |
+| `groupDms` | `{ "<group DM ID>": { "bu", "sub", "label", "members" } }`. Group DMs are measured **only** if listed here, and only by ID. `label` is how the group DM looks in your sidebar. `members` is the full member list (you included) that the ID was matched on; if a later listing shows different members, the report flags it in section 5 so the assignment can be re-checked. |
+| `pendingGroupDms` | `[{ "label", "bu", "sub", "candidates": [IDs], "note" }]`. Group DMs you want assigned but that are not decided yet. They are never measured; the report lists them with each candidate's members until you move the right ID into `groupDms`. |
 
-Keys that start with `_` are comments. Re-run step 1 to check the result. Step 2's rules are re-applied every time step 3 runs, so you only need to re-list channels when channels are added.
+Keys that start with `_` are comments. After editing, check the result with `node scripts/slack-channels.js --from-cache`. The rules are also re-applied every time step 3 runs, so you only need to list channels from Slack again when channels or group DMs are added.
+
+**Why group DMs are matched by ID and full member set, never by name:** Slack's sidebar shortens group DM names ("Alex Rivera, Sam Ok..."), and the same people are in many group DMs, so a partial name often fits several of them. Only the ID is unique; the recorded member set lets a person check the match and lets the script notice when it changes.
 
 ## Step 3: measure
 ```bash
@@ -52,7 +65,7 @@ node scripts/slack-measure.js --days 14 --in-price 0.15 --out-price 0.60
 The report shows:
 - tokens per day for every day in the window
 - the average day vs the peak day, and the bot share
-- a per-business-unit table
+- a table per business unit, with a row for each sub-group under it
 - the top 10 channels
 - channels with no activity
 - channels it could not read

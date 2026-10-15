@@ -1,17 +1,19 @@
 {
-  "_comment": "Example only. Copy to config/slack-bus.json (git-ignored) and put the real rules there. See docs/slack-measurement.md.",
-  "_rules": "Public and private channels: first matching rule wins. Use \"prefix\" or \"regex\" (case-insensitive).",
+  "_comment": "Example only. Copy to config/slack-bus.json (git-ignored) and put the real rules there. Format: docs/slack-measurement.md. Check with: node scripts/slack-channels.js --from-cache",
   "rules": [
-    { "bu": "unit-a", "prefix": "unita-" },
-    { "bu": "unit-b", "regex": "^(unitb|bravo)-" }
+    { "bu": "Unit A", "name": ["unit-a-general", "unit-a-ops"] },
+    { "bu": "Unit B", "sub": "Customers", "prefix": "cust-" },
+    { "bu": "Unit B", "sub": "Customers", "glob": "*-coordination*" },
+    { "bu": "Unit B", "sub": "Internal", "regex": "^(team|staff)-" }
   ],
-  "_overrides": "By channel ID; beats the rules. null leaves the channel out on purpose.",
   "overrides": {
-    "C0000000001": "unit-a",
+    "C0000000001": { "bu": "Unit A" },
     "C0000000002": null
   },
-  "_groupDms": "Group DMs are only measured if listed here, each with its business unit.",
   "groupDms": {
-    "G0000000001": "unit-b"
-  }
+    "C0000000003": { "bu": "Unit B", "sub": "Internal", "label": "Alex, Sam", "members": ["Alex", "Sam", "You"] }
+  },
+  "pendingGroupDms": [
+    { "label": "Alex, Jordan...", "bu": "Unit A", "candidates": ["C0000000004", "C0000000005"], "note": "two group DMs fit; pick one" }
+  ]
 }

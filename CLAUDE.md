@@ -47,4 +47,5 @@ Node + Fastify service on this Mac mini that runs named jobs on request. Rules b
 - The Slack user token is read only from `~/.lab/slack-token` (mode 600, enforced). Never print it, log it, put it on a command line or in an env var, or commit it.
 - Read-only Slack calls only. The client refuses any method not in its list (`conversations.list/history/replies/members`, `users.list`); do not add a method that writes to Slack.
 - Never write, log or print message text. Only per-channel, per-day counts go to `data/` (git-ignored, files written mode 600).
-- Business-unit rules are in `config/slack-bus.json` (git-ignored; template `config/slack-bus.example.json`). Keep real channel IDs and unit names out of the repo.
+- Business-unit rules are in `config/slack-bus.json` (git-ignored; template `config/slack-bus.example.json`). Keep real channel IDs, unit names and people's names out of the repo, including docs and examples.
+- Group DMs are assigned only by ID, with the full member set recorded, never by a partial sidebar name. If a name fits more than one group DM, or none, put it in `pendingGroupDms` and ask the user; do not guess. Check rule changes with `node scripts/slack-channels.js --from-cache` (no Slack calls).

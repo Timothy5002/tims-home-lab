@@ -45,6 +45,7 @@ function textLength(m) {
 
 function label(ch) {
   if (ch.type !== 'group_dm') return `#${ch.name}`;
+  if (!ch.name.startsWith('mpdm-')) return `DM: ${ch.name}`; // a group DM someone gave a name
   const names = (ch.memberNames ?? []).join(', ');
   return `DM: ${names.length > 40 ? names.slice(0, 39) + '…' : names || ch.id}`;
 }
@@ -105,7 +106,7 @@ function label(ch) {
       if (viaThread) (threadsByDay[day] ??= new Set()).add(m.thread_ts);
     };
     const threads = [];
-    const result = { id: ch.id, name: ch.name, type: ch.type, bu: ch.bu, label: label(ch), days: perDay };
+    const result = { id: ch.id, name: ch.name, type: ch.type, bu: ch.bu, sub: ch.sub, group: ch.group, label: label(ch), days: perDay };
     try {
       await slack.paginate('conversations.history',
         { channel: ch.id, oldest: String(lookbackStart), latest: String(windowEnd), limit: '200' }, 'messages', (msgs) => {
@@ -138,12 +139,15 @@ function label(ch) {
   const peak = (byDay) => Object.entries(byDay).reduce((best, e) => (e[1] > best[1] ? e : best), [dayList[0], -1]);
 
   const bus = [...new Set(results.map((r) => r.bu))].sort();
-  const buStats = bus.map((bu) => {
-    const rs = results.filter((r) => r.bu === bu);
+  const statsFor = (rs) => {
     const chars = sumDays(rs, 'chars');
     const chunks = Object.fromEntries(dayList.map((d) => [d, Math.ceil(chars[d] / LOCAL_CHUNK_CHARS)]));
-    return { bu, channels: rs.length, chars, chunks, messages: sumDays(rs, 'messages') };
-  });
+    return { channels: rs.length, chars, chunks, messages: sumDays(rs, 'messages') };
+  };
+  const buStats = bus.map((bu) => ({ bu, ...statsFor(results.filter((r) => r.bu === bu)) }));
+  // Sub-group rows sit under their business unit in the table; channels without a sub-group only count in the BU row.
+  const subStats = (bu) => [...new Set(results.filter((r) => r.bu === bu && r.sub).map((r) => r.sub))].sort()
+    .map((sub) => ({ bu: `    ${sub}`, ...statsFor(results.filter((r) => r.bu === bu && r.sub === sub)) }));
 
   console.log('\nTokens per day (all business units):');
   printTable(['day', 'messages', 'characters', 'est. tokens', 'threads'],
@@ -154,24 +158,24 @@ function label(ch) {
   console.log(`\n  Average: ${fmtInt(tokens(avgChars))} tokens/day.  Peak: ${fmtInt(tokens(peakChars))} on ${peakDay}` +
     (avgChars ? ` (${(peakChars / avgChars).toFixed(1)}x average).` : '.') + `  Bot messages: ${Math.round(botShare * 100)}% of characters.`);
 
-  console.log('\nPer business unit (est. tokens):');
-  printTable(['business unit', 'channels', 'msgs/day', 'avg tokens/day', 'peak tokens/day', 'peak day', '8k-char chunks/day (avg)'],
-    buStats.map((b) => { const [pd, pc] = peak(b.chars); return [b.bu, b.channels, fmtInt(avg(b.messages)), fmtInt(tokens(avg(b.chars))), fmtInt(tokens(pc)), pc > 0 ? pd : "-", avg(b.chunks).toFixed(1)]; }));
+  console.log('\nPer business unit and sub-group (est. tokens):');
+  printTable(['business unit / sub-group', 'channels', 'msgs/day', 'avg tokens/day', 'peak tokens/day', 'peak day', '8k-char chunks/day (avg)'],
+    buStats.flatMap((b) => [b, ...subStats(b.bu)]).map((b) => { const [pd, pc] = peak(b.chars); return [b.bu, b.channels, fmtInt(avg(b.messages)), fmtInt(tokens(avg(b.chars))), fmtInt(tokens(pc)), pc > 0 ? pd : "-", avg(b.chunks).toFixed(1)]; }));
 
   const totalChars = (r) => Object.values(r.days).reduce((s, d) => s + d.chars, 0);
   const active = results.filter((r) => !r.error && totalChars(r) > 0).sort((a, b) => totalChars(b) - totalChars(a));
   console.log('\nTop 10 channels:');
   printTable(['channel', 'business unit', 'avg tokens/day', 'messages', 'threads'],
-    active.slice(0, 10).map((r) => [r.label, r.bu, fmtInt(tokens(totalChars(r)) / days),
+    active.slice(0, 10).map((r) => [r.label, r.group, fmtInt(tokens(totalChars(r)) / days),
       fmtInt(Object.values(r.days).reduce((s, d) => s + d.messages, 0)), fmtInt(Object.values(r.days).reduce((s, d) => s + d.threads, 0))]));
 
   const quiet = results.filter((r) => !r.error && totalChars(r) === 0 && Object.keys(r.days).length === 0);
   console.log(`\nNo activity in the window (${quiet.length}):`);
-  for (const r of quiet) console.log(`  ${r.label} (${r.bu})`);
+  for (const r of quiet) console.log(`  ${r.label} (${r.group})`);
   const failed = results.filter((r) => r.error);
   if (failed.length) {
     console.log(`\nCould not read (${failed.length}); these are not in the totals:`);
-    for (const r of failed) console.log(`  ${r.label} (${r.bu}): ${r.error}`);
+    for (const r of failed) console.log(`  ${r.label} (${r.group}): ${r.error}`);
   }
 
   // Model estimates. Output size is an assumption (--out-tokens per business unit per day), not a measurement.
@@ -197,7 +201,7 @@ function label(ch) {
   const outFile = path.join(DATA_DIR, `slack-measure-${localDay(new Date())}.json`);
   writePrivateJson(outFile, {
     generatedAt: new Date().toISOString(), days: dayList, threadLookbackDays: lookback, charsPerToken: CHARS_PER_TOKEN,
-    channels: results.map(({ id, name, type, bu, days: d, error }) => ({ id, name, type, bu, days: d, ...(error ? { error } : {}) })),
+    channels: results.map(({ id, name, type, bu, sub, days: d, error }) => ({ id, name, type, bu, sub, days: d, ...(error ? { error } : {}) })),
   });
   const s = slack.stats;
   console.log(`\n${s.calls} API calls, ${s.rateLimited} rate-limit waits (${Math.round(s.waitedMs / 1000)}s), runtime ${fmtDur(runtimeS)}. Counts saved to ${path.relative(ROOT, outFile)}.`);

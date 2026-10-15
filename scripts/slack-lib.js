@@ -104,11 +104,16 @@ function createClient() {
   return { call, paginate, stats };
 }
 
-// Business-unit rules. Shape (see config/slack-bus.example.json):
-//   rules:     [{ bu, prefix } | { bu, regex }]  first match wins; public and private channels only
-//   overrides: { "<channel id>": "<bu>" | null } beats the rules; null means "leave this channel out"
-//   groupDms:  { "<group DM id>": "<bu>" }        group DMs are only included if listed here
-// Keys starting with "_" are comments.
+// Business-unit rules. Shape (see config/slack-bus.example.json and docs/slack-measurement.md):
+//   rules:     [{ bu, sub?, name | prefix | glob | regex }]  public and private channels only; first match wins.
+//              name is an exact name or a list of them; glob uses * for "anything" and must match the whole name.
+//   overrides: { "<channel id>": { bu, sub? } | null }  beats the rules; null means "leave this channel out"
+//   groupDms:  { "<group DM id>": { bu, sub?, label?, members? } }  group DMs are only included if listed here;
+//              members (full names, you included) is the set the ID was matched on, and is re-checked on every run.
+//   pendingGroupDms: [{ label, bu, sub?, candidates: [ids], note? }]  not matched; listed in the report until decided.
+// Matching is case-insensitive. Keys starting with "_" are comments.
+const globToRegex = (g) => new RegExp(`^${g.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*')}$`, 'i');
+
 function loadConfig() {
   if (!fs.existsSync(CONFIG_FILE)) {
     throw new Error(`${path.relative(ROOT, CONFIG_FILE)} not found; copy ${path.relative(ROOT, EXAMPLE_CONFIG_FILE)} to it and edit it`);
@@ -116,40 +121,73 @@ function loadConfig() {
   let cfg;
   try { cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch (e) { throw new Error(`config/slack-bus.json is not valid JSON: ${e.message}`); }
   const bad = (msg) => { throw new Error(`config/slack-bus.json: ${msg}`); };
+  const target = (v, where) => {
+    if (!v || typeof v !== 'object' || typeof v.bu !== 'string' || !v.bu) bad(`${where} needs a "bu" name`);
+    if (v.sub !== undefined && (typeof v.sub !== 'string' || !v.sub)) bad(`${where}: "sub" must be a non-empty name`);
+    return { bu: v.bu, sub: v.sub ?? null };
+  };
   const rules = cfg.rules ?? [];
-  const overrides = cfg.overrides ?? {};
-  const groupDms = cfg.groupDms ?? {};
   if (!Array.isArray(rules)) bad('"rules" must be a list');
-  const compiled = rules.map((r, i) => {
-    if (!r || typeof r.bu !== 'string' || !r.bu) bad(`rule ${i + 1} needs a "bu" name`);
-    if (typeof r.prefix === 'string' && r.prefix) return { bu: r.bu, test: (n) => n.toLowerCase().startsWith(r.prefix.toLowerCase()) };
-    if (typeof r.regex === 'string' && r.regex) {
+  const compiled = [];
+  rules.forEach((r, i) => {
+    const where = `rule ${i + 1}`;
+    const t = target(r, where);
+    const kinds = ['name', 'prefix', 'glob', 'regex'].filter((k) => r[k] !== undefined);
+    if (kinds.length !== 1) bad(`${where} needs exactly one of "name", "prefix", "glob", "regex"`);
+    const kind = kinds[0];
+    // A list of names becomes one rule per name, so reports say which name matched.
+    const values = kind === 'name' && Array.isArray(r.name) ? r.name : [r[kind]];
+    for (const v of values) {
+      if (typeof v !== 'string' || !v) bad(`${where}: "${kind}" must be a non-empty string`);
       let re;
-      try { re = new RegExp(r.regex, 'i'); } catch (e) { bad(`rule ${i + 1} regex: ${e.message}`); }
-      return { bu: r.bu, test: (n) => re.test(n) };
+      if (kind === 'name') re = new RegExp(`^${v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i');
+      else if (kind === 'prefix') re = globToRegex(`${v.replace(/\*/g, '')}*`);
+      else if (kind === 'glob') re = globToRegex(v);
+      else { try { re = new RegExp(v, 'i'); } catch (e) { bad(`${where} regex: ${e.message}`); } }
+      compiled.push({ ...t, label: `rule ${i + 1} (${kind} ${v})`, test: (n) => re.test(n) });
     }
-    return bad(`rule ${i + 1} needs a "prefix" or a "regex"`);
   });
-  for (const [k, v] of Object.entries(overrides)) {
-    if (!k.startsWith('_') && v !== null && (typeof v !== 'string' || !v)) bad(`override ${k} must be a bu name or null`);
+  const overrides = {};
+  for (const [id, v] of Object.entries(cfg.overrides ?? {})) {
+    if (!id.startsWith('_')) overrides[id] = v === null ? null : target(v, `override ${id}`);
   }
-  for (const [k, v] of Object.entries(groupDms)) {
-    if (!k.startsWith('_') && (typeof v !== 'string' || !v)) bad(`group DM ${k} must map to a bu name`);
+  const groupDms = {};
+  for (const [id, v] of Object.entries(cfg.groupDms ?? {})) {
+    if (id.startsWith('_')) continue;
+    if (v.members !== undefined && (!Array.isArray(v.members) || !v.members.every((m) => typeof m === 'string'))) bad(`group DM ${id}: "members" must be a list of names`);
+    groupDms[id] = { ...target(v, `group DM ${id}`), label: v.label ?? null, members: v.members ?? null };
   }
-  return { rules: compiled, overrides, groupDms };
+  // Group DMs waiting for a decision: not matched, only shown in the report with their candidates.
+  const pendingGroupDms = cfg.pendingGroupDms ?? [];
+  if (!Array.isArray(pendingGroupDms) || !pendingGroupDms.every((p) => p && typeof p.label === 'string' && Array.isArray(p.candidates))) {
+    bad('"pendingGroupDms" must be a list of { label, bu, sub?, candidates: [ids], note? }');
+  }
+  return { rules: compiled, overrides, groupDms, pendingGroupDms };
 }
 
-// Returns { bu, by } where by is how it was placed: override, rule, group-dm, excluded, or null if unplaced.
+// "BU > sub-group", or just "BU".
+const groupName = (t) => (t.sub ? `${t.bu} > ${t.sub}` : t.bu);
+const sameSet = (a, b) => a.length === b.length && [...a].sort().every((x, i) => x === [...b].sort()[i]);
+
+// Returns { bu, sub, group, by, matches, memberDrift }. by is how it was placed: override, rule, group-dm,
+// excluded, or null if unplaced. matches lists every rule that matched a channel (more than one is an overlap).
+// memberDrift is true when a listed group DM's current members differ from the members recorded in the config.
 function placeChannel(cfg, ch) {
+  const none = { bu: null, sub: null, group: null, by: null, matches: [] };
+  const matches = ch.type === 'group_dm' ? [] : cfg.rules.filter((r) => r.test(ch.name)).map((r) => ({ label: r.label, group: groupName(r) }));
   if (Object.hasOwn(cfg.overrides, ch.id)) {
-    const bu = cfg.overrides[ch.id];
-    return bu === null ? { bu: null, by: 'excluded' } : { bu, by: 'override' };
+    const t = cfg.overrides[ch.id];
+    return t === null ? { ...none, by: 'excluded', matches } : { ...t, group: groupName(t), by: 'override', matches };
   }
   if (ch.type === 'group_dm') {
-    return Object.hasOwn(cfg.groupDms, ch.id) ? { bu: cfg.groupDms[ch.id], by: 'group-dm' } : { bu: null, by: null };
+    const t = cfg.groupDms[ch.id];
+    if (!t) return none;
+    const memberDrift = Boolean(t.members && ch.memberNames && !sameSet(t.members, ch.memberNames));
+    return { bu: t.bu, sub: t.sub, group: groupName(t), by: 'group-dm', matches, memberDrift };
   }
-  const rule = cfg.rules.find((r) => r.test(ch.name));
-  return rule ? { bu: rule.bu, by: 'rule' } : { bu: null, by: null };
+  if (!matches.length) return none;
+  const first = cfg.rules.find((r) => r.test(ch.name));
+  return { bu: first.bu, sub: first.sub, group: groupName(first), by: 'rule', matches };
 }
 
 // Writes JSON readable only by this user (the files hold channel names and member names).
@@ -180,5 +218,5 @@ function printTable(header, rows) {
 
 module.exports = {
   ROOT, DATA_DIR, CHANNELS_FILE, CONFIG_FILE,
-  createClient, SlackError, loadConfig, placeChannel, writePrivateJson, localDay, fmtInt, printTable, sleep,
+  createClient, SlackError, loadConfig, placeChannel, groupName, writePrivateJson, localDay, fmtInt, printTable, sleep,
 };
