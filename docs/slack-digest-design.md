@@ -102,7 +102,7 @@ A run fetches about 180 conversations (Slack calls spaced 1.3 s apart) and then 
 **Window.** Each run covers everything since the last successful scheduled run, capped at 72 hours, so Mondays and missed days are covered. The time of the last success is kept in `data/digest-state.json`, which holds a timestamp only. With no recorded run, the window is the last 24 hours. Hand runs never move that timestamp unless asked to.
 
 ## Pipeline
-1. **Plan.** Load the config and the saved channel list. Take every conversation mapped to a unit, decide the window, and derive the external flag.
+1. **Plan.** Load the config and the saved channel list; on scheduled runs, first refresh that list with paged `conversations.list` calls (conversations left or archived are dropped; new ones that match no rule or override are never read, only named in the DM thread's footer). Take every conversation mapped to a unit, decide the window, and derive the external flag.
 2. **Fetch** with the shared read-only client (`src/slack.js`):
    - history for the window, plus a 14-day thread lookback to find older threads with new replies, then those replies.
    - Each message keeps: conversation, `ts`, thread, author, a bot flag and text (message text plus attachment text). Housekeeping events (joins, topic changes and similar) are skipped.
@@ -111,14 +111,14 @@ A run fetches about 180 conversations (Slack calls spaced 1.3 s apart) and then 
    - Per template, keep the first and the latest example (cut to 300 characters), plus a count.
    - Always keep up to 5 instances containing alert words (error, failed, down, outage, escalate, urgent, cancel, refund, churn, complaint and similar).
    - The compression ratio is reported every run.
-4. **Group** by the customer registry (each customer's success, coordination and external channels) and by unit mode (full, brief, off). Mentions of customers in Leadership and Internal channels are found by alias in code.
+4. **Group** by the customer registry (each customer's success, coordination and external channels; customer-unit conversations that are not customers go to one brief "other" bucket) and by unit mode (full, brief, off). Mentions of customers in Leadership and Internal channels are found by alias in code.
 5. **Plan under the caps.** Estimate input tokens (characters ÷ 4) before any model call. Customers go first, then sub-groups, busiest first. What does not fit the 400,000-token run cap is marked "not summarized (cap)" with counts, and the run does not abort. A call over the 100,000-token per-call cap keeps its newest messages.
 6. **Mask** external text (phase 2 onward). Phase 1 runs the masking on the would-be input and reports counts only.
 7. **Model calls:**
    - stage 1: one JSON call per active customer conversation (problems and risks, each with an evidence category)
    - stage 2: one synthesis call per customer with findings or mentions (one headline, supporting points, all channels merged)
    - one per full-mode sub-group that is not customers (archive only), one per brief-mode unit (at most 3 items), one incident check per off-mode unit
-   - at most 3 at a time, each with a timeout, one primary retry and one fallback
+   - at most 3 at a time, starts at least 1.5 s apart, each with a timeout, one primary retry and one fallback
 8. **Validate** replies against their schema and drop claims with invalid references, and apply the noise rules in code: only evidence categories survive; bot hygiene, personnel and other items are dropped and counted; severity, the Leadership flag, the best link and "bot report" are decided in code. Sanitize model text by removing URLs, `<@…>`, `<!channel>`, `<!here>` and link syntax, so links only come from code and a crafted message cannot make the digest mention or link anyone.
 9. **Render** `data/digests/<date>.md` (mode 600), merged by customer: notable customers ranked (severity, Leadership, strong points, volume) with every point including low ones, quiet customers on one line, incidents, units by mode, skipped counts, and a footer with counts, masking counts, tokens, cost and runtime.
 10. **Finish.** Record the success, prune old digests, send the DM when scheduled, drop all text, write the run row, and ping the healthcheck when scheduled.
@@ -158,7 +158,7 @@ It checks the `notable` flags, the expected issues, that every reference is vali
 
 ## Customer registry (built in the redesign; health not yet approved)
 - **`config/digest-customers.json`** (git-ignored, with a tracked example): prefixes, suffixes and filler words for deriving keys from channel names, extra keys, aliases, hand assignments, general channels and mention channels.
-- **Derivation is code:** success channels define customers; other customer channels join by key; unmatched channels are listed and still analyzed. `node scripts/digest-customers.js` prints the registry for review.
+- **Derivation is code:** success channels define customers; other customer channels join by key; customers configured without a success channel collect their channels by key; unmatched channels are listed and still analyzed. Conversations that are not customers at all go to the "other" bucket (one brief summary). Short upper-case names can be matched case-sensitively (`exactAliases`). `node scripts/digest-customers.js` prints the registry for review.
 - **Not built:** health as runtime state (`set-health red|yellow|green`) and ordering by health, and owners.
 
 ## Leadership-contradiction check (phase 5, not yet approved; the redesign only flags that Leadership discussed a customer)
@@ -185,7 +185,7 @@ It checks the `notable` flags, the expected issues, that every reference is vali
 | Timeout per model call | 90 s |
 | Retries | one primary retry after about 3 s for a timeout, 5xx or 429; then one attempt on the secondary after a timeout, 5xx, 429 or provider mismatch; at most three requests per call |
 | Run deadline | 25 min |
-| Concurrency | at most 3 model calls |
+| Concurrency | at most 3 model calls at once, starts at least 1.5 s apart |
 | Month-to-date spend cap | to be decided |
 | Logged per run (no text) | conversations, messages, characters, compression ratio, masked items by type, model calls, fallbacks, model and provider per call, input tokens (cached and not), output and reasoning tokens, cost, runtime, dropped claims |
 

@@ -232,6 +232,53 @@ function permalink(workspaceUrl, channel, ts, threadTs) {
   return threadTs && threadTs !== ts ? `${base}?thread_ts=${threadTs}&cid=${channel}` : base;
 }
 
+const channelType = (c) => (c.is_mpim ? 'group_dm' : c.is_private ? 'private' : 'public');
+
+// Lists every non-archived channel and group DM the token can see, with paged conversations.list calls only, and
+// marks the ones the user is in. Membership comes from the listing itself (no extra method): Slack only returns
+// private channels and group DMs to a user token when the user is in them, so those count as member when
+// is_member is missing. Used by scripts/slack-channels.js and by the digest's daily refresh.
+async function listConversations(slack) {
+  const raw = await slack.paginate('conversations.list',
+    { types: 'public_channel,private_channel,mpim', exclude_archived: 'true', limit: '200' }, 'channels');
+  let assumedMember = 0;
+  const seen = { public: 0, private: 0, group_dm: 0 };
+  const member = { public: 0, private: 0, group_dm: 0 };
+  const memberIds = new Set();
+  for (const c of raw) {
+    seen[channelType(c)]++;
+    const isMember = typeof c.is_member === 'boolean' ? c.is_member : (c.is_private || c.is_mpim ? (assumedMember++, true) : false);
+    if (isMember) { member[channelType(c)]++; memberIds.add(c.id); }
+  }
+  return { raw, memberIds, seen, member, assumedMember };
+}
+
+// Applies a fresh listing (listConversations) to the saved channel list, for the digest's daily refresh.
+// Conversations the user is still in keep their saved details (group DM members, last activity) with the name,
+// size and shared flag updated; new ones are added with what the listing knows (no extra calls, so a new group
+// DM has no member names); conversations that were archived or left are dropped. Returns the new list plus the
+// added and removed entries. Names and IDs only; nothing is read from any conversation.
+function applyListing(saved, listing) {
+  const byId = new Map(listing.raw.map((c) => [c.id, c]));
+  const keep = (id) => listing.memberIds.has(id) || (saved.scope === 'all' && byId.has(id));
+  const old = new Map(saved.channels.map((c) => [c.id, c]));
+  const channels = [];
+  const removed = saved.channels.filter((c) => !keep(c.id));
+  const added = [];
+  for (const c of listing.raw) {
+    if (!keep(c.id)) continue;
+    const fresh = { name: c.name, isMember: listing.memberIds.has(c.id), isExtShared: Boolean(c.is_ext_shared),
+      ...(c.is_mpim ? {} : { members: c.num_members ?? null }) };
+    if (old.has(c.id)) channels.push({ ...old.get(c.id), ...fresh });
+    else {
+      const ch = { id: c.id, type: channelType(c), members: c.num_members ?? null, lastActivity: null, ...fresh };
+      channels.push(ch);
+      added.push(ch);
+    }
+  }
+  return { channels, added, removed };
+}
+
 // Writes JSON readable only by this user (the files hold channel names and member names).
 function writePrivateJson(file, obj) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -261,4 +308,5 @@ function printTable(header, rows) {
 module.exports = {
   ROOT, DATA_DIR, CHANNELS_FILE, CONFIG_FILE, SKIP_SUBTYPES, messageText, isBot, permalink, readSecret,
   createClient, SlackError, loadConfig, placeChannel, groupName, writePrivateJson, localDay, fmtInt, printTable, sleep,
+  channelType, listConversations, applyListing,
 };

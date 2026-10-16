@@ -32,6 +32,14 @@ function convLabel(conv, me) {
   return `DM: ${(conv.memberNames ?? []).filter((n) => n !== me).join(', ')}`;
 }
 
+// Name for a new conversation that matches no rule: "#name", or a new group DM's member handles from its internal
+// name (a new group DM has no member names yet, and none are fetched for it).
+function unmappedLabel(c) {
+  if (c.type !== 'group_dm') return `#${c.name}`;
+  if (!c.name.startsWith('mpdm-')) return `DM: ${c.name}`;
+  return `DM: ${c.name.replace(/^mpdm-/, '').replace(/-\d+$/, '').split('--').join(', ')}`;
+}
+
 // block: { conv, compressed: { humans, botGroups, stats }, parents, error }
 function renderConversation(block, ctx, { threads = 3, latest = 3, botGroups = 5 } = {}) {
   const { conv, compressed, parents } = block;
@@ -161,4 +169,4 @@ function renderArchive({ model, window, footer, ctx }) {
   return `${out.join('\n')}\n`;
 }
 
-module.exports = { renderDigest, renderArchive, renderConversation, snippet, convLabel, evidenceLinks };
+module.exports = { renderDigest, renderArchive, renderConversation, snippet, convLabel, unmappedLabel, evidenceLinks };

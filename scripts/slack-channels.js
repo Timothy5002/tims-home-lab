@@ -9,14 +9,9 @@
 const path = require('node:path');
 const { parseArgs } = require('node:util');
 const fs = require('node:fs');
-const { ROOT, CHANNELS_FILE, createClient, SlackError, loadConfig, placeChannel, writePrivateJson, localDay, printTable } = require('../src/slack');
+const { ROOT, CHANNELS_FILE, createClient, SlackError, loadConfig, placeChannel, writePrivateJson, localDay, printTable, channelType, listConversations } = require('../src/slack');
 
 const TYPE = { public: 'public', private: 'private', group_dm: 'group_dm' };
-
-function channelType(c) {
-  if (c.is_mpim) return TYPE.group_dm;
-  return c.is_private ? TYPE.private : TYPE.public;
-}
 
 // Section headings match the questions the report answers; see docs/slack-measurement.md.
 function report(cfg, channels) {
@@ -133,25 +128,9 @@ function report(cfg, channels) {
   const slack = createClient();
 
   process.stderr.write('Listing channels...\n');
-  const raw = await slack.paginate('conversations.list',
-    { types: 'public_channel,private_channel,mpim', exclude_archived: 'true', limit: '200' }, 'channels');
-
-  // Membership comes from conversations.list itself, so filtering costs no extra calls and happens
-  // before the per-channel lookups below. Slack only returns private channels and group DMs to a user
-  // token when the user is in them, so those count as member if is_member is missing.
-  let assumedMember = 0;
-  const isMember = (c) => {
-    if (typeof c.is_member === 'boolean') return c.is_member;
-    if (c.is_private || c.is_mpim) { assumedMember++; return true; }
-    return false;
-  };
-  const seen = { public: 0, private: 0, group_dm: 0 };
-  const member = { public: 0, private: 0, group_dm: 0 };
-  const memberIds = new Set();
-  for (const c of raw) {
-    seen[channelType(c)]++;
-    if (isMember(c)) { member[channelType(c)]++; memberIds.add(c.id); }
-  }
+  // Membership comes from conversations.list itself (src/slack.js), so filtering costs no extra calls and
+  // happens before the per-channel lookups below.
+  const { raw, memberIds, seen, member, assumedMember } = await listConversations(slack);
   const todo = opts.all ? raw : raw.filter((c) => memberIds.has(c.id));
   const sum = (o) => o.public + o.private + o.group_dm;
   console.log(`Conversations seen: ${raw.length} (archived excluded). Member of: ${memberIds.size}.` +

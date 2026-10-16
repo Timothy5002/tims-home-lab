@@ -43,7 +43,7 @@ It also checks that the JSON reply has the expected shape. It exits with an erro
 ```bash
 node scripts/digest-selftest.js
 ```
-Run this after changing masking (`src/mask.js`), the OpenRouter client (`src/openrouter.js`), validation, the registry, the pipeline, the archive, the DM, the send-only client or bot compression. Everything in it is invented, and it makes no network calls: the OpenRouter and Slack tests use fake APIs, and the pipeline test uses a stubbed model. It covers:
+Run this after changing masking (`src/mask.js`), the OpenRouter client (`src/openrouter.js`), validation, the registry, the pipeline, call concurrency, the membership refresh, the archive, the DM, the send-only client or bot compression. Everything in it is invented, and it makes no network calls: the OpenRouter and Slack tests use fake APIs, and the pipeline test uses a stubbed model. It covers:
 - **Masking:**
   - emails (plain, in angle brackets, Slack `<mailto:…|…>`), phone numbers with dashes, dots, spaces, brackets and `+` codes, long numbers, URLs with queries or tokens, and secret-looking strings
   - things that must **not** be masked: dates, amounts, versions, mentions, and names, emails and numbers in secrets-only masking
@@ -55,9 +55,11 @@ Run this after changing masking (`src/mask.js`), the OpenRouter client (`src/ope
   - the input, output and cost caps, the per-call context check, and the worst-case cost of timed-out requests
   - reasoning tokens in cost and caps, and the cost arithmetic; single-route calls retry once and never fall back
 - **Validation and the noise rules:** references and masking, uncited items dropped, bot hygiene, personnel and non-evidence items dropped and counted, bot reports labeled in code, item limits, brief items cut to 12 words; synthesis severity from the strongest kept point, a 20-word headline, and the Leadership flag only from a cited Leadership message.
-- **The registry:** success channels define customers; coordination and external channels join by key or extra keys; unmatched channels are grouped and still get a record; general channels; mention channels; whole-word, case-insensitive alias matching.
-- **The pipeline end to end** (stubbed model): one merged record per customer across its channels, Leadership mentions reaching the synthesis, personnel dropped, ranking, the fallback when a synthesis call fails, your own conversation left out of the brief summary, unit modes, incidents, skipped counts, and the archive file's structure and links.
+- **The registry:** success channels define customers; coordination and external channels join by key or extra keys; a configured customer with no success channel collects its channels by key; unmatched channels are grouped and still get a record; general channels; the "other" bucket (neither a customer nor unmatched); mention channels; whole-word, case-insensitive alias matching; exact-case aliases; automatic aliases switched off with `noMention`.
+- **The pipeline end to end** (stubbed model): the "other" bucket as one brief summary and no customer record; one merged record per customer across its channels, Leadership mentions reaching the synthesis, personnel dropped, ranking, the fallback when a synthesis call fails, your own conversation left out of the brief summary, unit modes, incidents, skipped counts, and the archive file's structure and links.
 - **The DM:** section order, the needs-attention line, no low items anywhere in the DM, the footer only in the thread, the 1,500-character cap with many long customers (at most 5 needing attention, each customer once), and escaping.
+- **Model calls:** at most 3 at once, starts spaced by the gap.
+- **The membership refresh:** membership from `conversations.list` only (private channels and group DMs without `is_member` count as member); kept conversations keep their saved details under the new name, new ones are added, left or archived ones dropped; names for new unmapped conversations.
 - **Cap planning** on an oversized invented window (about 840,000 tokens): the plan stays under 400,000, the busiest customers come first, a call over the per-call cap keeps its newest messages, skipped calls are never sent, and the archive lists them as not summarized with counts.
 - **Delivery:** the send-only client (fake Slack) opens the DM, refuses a DM that is not the recipient's, a channel, a non-user recipient and any post before the DM is verified, replies only under a message it posted, knows only two methods, and sends the token only in the Authorization header.
 - **The healthcheck helper:** a loose or missing URL file is refused; success and `/fail` pings; the body is cut to 10 kB.
@@ -82,13 +84,27 @@ node src/digest/run.js --from 2026-10-14T03:44:36Z --to 2026-10-15T03:44:37Z --m
 ## The morning schedule (phase 3)
 `launchd/com.lab.schedule.slack-digest.plist` runs `node src/digest/run.js --scheduled` every day at 06:00 local time. It runs outside the dispatcher, the one approved exception, because a run takes minutes. A scheduled run:
 1. Checks that `~/.lab/healthcheck-url-slack-digest` is a regular file with mode 600. Without it the run stops at once (there is nothing to ping).
-2. Covers everything since the last success, capped at 72 hours (24 hours if none is recorded).
-3. Writes the digest file, then deletes all but the newest 14 digests.
-4. Sends the DM (below).
-5. Only if the DM was delivered, records the success in `data/digest-state.json` (written to a temp file and renamed, so it is never half-written). A failed delivery leaves the record where it was, so the next run covers the same window again.
-6. Pings the healthcheck: success, or `/fail` on any error, the 25-minute deadline or a failed delivery. The ping body is stats only: model and provider, retries and fallbacks with reasons, customers merged and notable, items kept and dropped (by reason), calls over the cap, cost, runtime and delivery status.
+2. Refreshes the conversation list (see "Daily membership refresh" below).
+3. Covers everything since the last success, capped at 72 hours (24 hours if none is recorded).
+4. Writes the digest file, then deletes all but the newest 14 digests.
+5. Sends the DM (below).
+6. Only if the DM was delivered, records the success in `data/digest-state.json` (written to a temp file and renamed, so it is never half-written). A failed delivery leaves the record where it was, so the next run covers the same window again.
+7. Pings the healthcheck: success, or `/fail` on any error, the 25-minute deadline or a failed delivery. The ping body is stats only: model and provider, retries and fallbacks with reasons, customers merged and notable, items kept and dropped (by reason), calls over the cap, cost, the membership refresh counts, runtime and delivery status.
 
 The log is `~/Library/Logs/lab-dispatcher/schedule-slack-digest.log`. It holds stats only, with no per-conversation progress and never any text. To run it now: `launchctl kickstart -k gui/$(id -u)/com.lab.schedule.slack-digest`. That is a real run: it sends the DM, records the success and pings.
+
+**A test run that does not move the last-success record:** `kickstart` cannot pass arguments, so run the schedule's own command by hand with an explicit window. `--from`/`--to` (or `--hours`) is never recorded, even with `--scheduled`, so the next 06:00 run still covers everything since the last real one. It refreshes the conversation list, sends the DM and pings the healthcheck like the schedule does:
+```bash
+node src/digest/run.js --scheduled --from "$(date -u -v-24H +%Y-%m-%dT%H:%M:%SZ)" --to "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+```
+
+## Daily membership refresh
+Every scheduled run starts by re-reading the conversation list with paged `conversations.list` calls (about 13 calls, under a minute; no other method, no per-channel lookups) and updating `data/slack-channels.json`. A hand run does it with `--refresh`.
+- **Conversations you left, or that were archived,** are dropped from the list and counted (`membership.removed` in the stats).
+- **New conversations that match a rule, override or group DM entry** in `config/slack-bus.json` are read like any other.
+- **New conversations that match nothing** are never read or sent to any model. The DM thread's footer names them (`N new, unmapped: names`), the archive file lists them, and the stats and log hold only their count. To include one, add a rule or override (or a `groupDms` entry, by ID) to `config/slack-bus.json`. They are named once: the next refresh no longer counts them as new.
+- **A new group DM** has no member names in the list (none are fetched); it is named by the handles in its internal name. `node scripts/slack-channels.js` fills in members.
+- **If the refresh fails** (a Slack error), the run carries on with the saved list, and the stats and the thread footer say so.
 
 **Install or change it:** `scripts/install-agent.sh launchd/com.lab.schedule.slack-digest.plist`. The healthcheck URL file must exist first. In healthchecks.io the suggested period is 1 day, with a 2-hour grace time.
 
@@ -96,9 +112,10 @@ The log is `~/Library/Logs/lab-dispatcher/schedule-slack-digest.log`. It holds s
 The digest merges each customer's channels into one record. The registry is derived in code (`src/digest/customers.js`) from channel names, using `config/digest-customers.json`:
 - **Customers:** each channel in `anchorSources` (the Success sub-group) defines a customer. Its key is the channel name, lower case, with `stripPrefixes` and `stripSuffixes` removed (longest first, repeatedly), split on `-`, `_` and `.`, with `dropWords` removed and the rest joined. The display name is the remaining words.
 - **Other customer channels** (`customerSources`, such as coordination and external channels) join a customer when their key equals the customer's key or one of its extra `keys`, or when one key contains the other (the shorter at least `minContainLength`, 5). More than one candidate is ambiguous and never guessed.
-- **Exceptions:** under `customers`, give a customer a `name`, extra `keys` (spelling or hyphenation differences), `aliases` for mentions, or `channels` assigned by hand. `notCustomers` lists general channels in the customer sub-groups. They are summarized as a unit, not as a customer.
+- **Exceptions:** under `customers`, give a customer a `name`, extra `keys` (spelling or hyphenation differences), `aliases` for mentions, `exactAliases` (matched case-sensitively), or `channels` assigned by hand. A customer listed there with no success channel still collects every customer channel whose key equals its own, so it is a customer, not "unmatched". `notCustomers` lists general channels in the customer sub-groups. They are summarized as a unit, not as a customer.
+- **The "other" bucket** (`otherBucket`: a name and a list of channel names or IDs) holds customer-unit conversations that are not customers (prospects, people, demos, group DMs). They get one brief summary under the bucket's name (at most 3 one-line items, shown under Other units in the DM) and are never ranked as customers or used for mentions.
 - **Unmatched channels** are still analyzed. Those sharing a key form one record, and the rest (group DMs, ambiguous ones) get one each. They are marked unmatched.
-- **Mentions:** messages in `mentionSources` (Leadership, with `leadership: true`, and Internal) are matched to customers by alias, in code. The match is whole-word and case-insensitive, and allows `-`, `_`, a space or nothing between an alias's words. Automatic aliases are the success channel's words. Shorter than `minAliasLength` (4), they are skipped; add short names as aliases by hand, and switch off a bad automatic alias with `noMention`.
+- **Mentions:** messages in `mentionSources` (Leadership, with `leadership: true`, and Internal) are matched to customers by alias, in code. The match is whole-word and case-insensitive, and allows `-`, `_`, a space or nothing between an alias's words. Automatic aliases are the success channel's words. Shorter than `minAliasLength` (4), they are skipped; add short names as aliases by hand, and switch off a bad automatic alias with `noMention` (the customer's own channels still count). A short upper-case name that is also an ordinary word goes in `exactAliases`, which match only in that exact case (still whole word).
 
 **Review it:** `node scripts/digest-customers.js` prints each customer with its channels and mention aliases, the channels that matched no customer (with their key or the ambiguous candidates), the general channels and the mention channels. It shows names only, makes no Slack calls and reads no messages.
 
@@ -150,15 +167,16 @@ Before any call, the run plans what fits. Customers go first, then sub-groups, b
 node src/digest/run.js                # window: since the last recorded run (max 72 h), or the last 24 h
 node src/digest/run.js --no-model     # code-only digest (no model calls)
 node src/digest/run.js --reasoning    # turn the primary model's reasoning on (off by default)
-node src/digest/run.js --hours 48     # a fixed window, for testing
+node src/digest/run.js --hours 48     # a fixed window, for testing (never recorded)
 node src/digest/run.js --record       # also record this run as the last success (scheduled runs do this)
 node src/digest/run.js --deliver      # also send the Slack DM (scheduled runs do this)
-node src/digest/run.js --from <ISO> --to <ISO>   # a fixed window (never recorded)
+node src/digest/run.js --refresh      # also refresh the conversation list first (scheduled runs do this)
+node src/digest/run.js --from <ISO> --to <ISO>   # a fixed window (never recorded, even with --scheduled or --record)
 ```
 It takes about 5 minutes, because Slack calls are spaced to stay under the rate limits. The steps:
-1. **Fetch** every conversation mapped to a unit. Unassigned group DMs are left out. The fetch reads the window plus a 14-day lookback, so older threads with new replies are found.
+1. **Fetch** every conversation mapped to a unit (after the membership refresh on scheduled runs). Unassigned group DMs and new unmapped conversations are left out. The fetch reads the window plus a 14-day lookback, so older threads with new replies are found.
 2. **Compress bot posts** in code (`src/digest/compress.js`). Messages from one bot that share a template (the text with numbers, IDs, links and dates replaced) become one line with a count, plus the latest example. Instances with alert words (failed, error, outage, cancel…) are always listed.
-3. **The model pipeline** (see "How a model run works"): at most 3 calls at a time, through the primary route with its retry and fallback rules. Text is masked before sending (see below).
+3. **The model pipeline** (see "How a model run works"): at most 3 calls at a time, their starts at least 1.5 seconds apart, through the primary route with its retry and fallback rules. Text is masked before sending (see below).
 4. **Write** `data/digests/<date>.md` (mode 600, git-ignored), merged by customer:
    - each notable customer: severity, Leadership flag, headline, every supporting point (low included) with its category, "bot report" label and links, the channels with message counts, and mention counts
    - customers with nothing notable on one line, and what was not summarized and why

@@ -13,9 +13,12 @@
   "minAliasLength": 4,
   "customers": {
     "acmecorp": { "name": "Acme Corp", "keys": ["acme"], "aliases": ["Acme"] },
-    "birchhealth": { "aliases": ["Birch Health", "Birch"], "channels": ["birch-onboarding"] }
+    "birchhealth": { "aliases": ["Birch Health", "Birch"], "channels": ["birch-onboarding"] },
+    "oak": { "name": "OAK", "exactAliases": ["OAK"] },
+    "zenith": { "name": "Zenith" }
   },
   "notCustomers": ["partner-and-ourco", "partner-updates"],
+  "otherBucket": { "name": "Other Unit B", "channels": ["prospect-demo", "C0INVENTED1"] },
   "noMention": ["general"],
-  "_keys": "customerSources: unit > sub-groups whose conversations belong to customers. anchorSources: where each conversation defines a customer (the success channels). mentionSources: scanned for customer mentions; leadership: true sets the Leadership flag. stripPrefixes/stripSuffixes/dropWords: how a channel name becomes a key. minContainLength: a key joins a customer when one contains the other and the shorter is at least this long. minAliasLength: shorter automatic aliases are not used for mentions. customers: names, extra keys (spelling or hyphenation differences), aliases for mentions, and channels assigned by hand. notCustomers: general channels in the customer sources. noMention: automatic aliases never used for mentions."
+  "_keys": "customerSources: unit > sub-groups whose conversations belong to customers. anchorSources: where each conversation defines a customer (the success channels). mentionSources: scanned for customer mentions; leadership: true sets the Leadership flag. stripPrefixes/stripSuffixes/dropWords: how a channel name becomes a key. minContainLength: a key joins a customer when one contains the other and the shorter is at least this long. minAliasLength: shorter automatic aliases are not used for mentions. customers: names, extra keys (spelling or hyphenation differences), aliases for mentions, exactAliases (matched case-sensitively, for short upper-case names that are also ordinary words), and channels assigned by hand; a customer listed here with no success channel collects the channels whose key equals its own. notCustomers: general channels in the customer sources. otherBucket: customer-source conversations that are not customers (names or IDs); they get one brief summary under that name and are never ranked. noMention: automatic aliases never used for mentions."
 }

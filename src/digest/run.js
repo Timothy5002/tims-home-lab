@@ -11,6 +11,13 @@
 // only after the digest file is written and, when delivering, only after the delivery succeeded, so a failed
 // delivery makes the next run cover the window again.
 //
+// Membership refresh (scheduled runs, or --refresh): before anything else, the conversation list is re-read with
+// paged conversations.list calls (src/slack.js) and data/slack-channels.json is updated. Conversations the user
+// left or that were archived are dropped (counted). New ones that match a rule or override in config/slack-bus.json
+// are read like any other; new ones that match nothing are never read or sent to a model, only named in the DM
+// thread's footer and the archive file (stats and logs hold their count only). If the refresh fails, the run goes
+// on with the saved list and the stats say so.
+//
 // Scheduled runs (--scheduled, from launchd/com.lab.schedule.slack-digest.plist at 06:00): deliver the digest by
 // Slack DM (src/slack-send.js: a short top-level message and one threaded reply; no file), record the success,
 // and ping ~/.lab/healthcheck-url-slack-digest with stats only: success, or /fail on any error, deadline or failed
@@ -20,19 +27,21 @@
 // the last KEEP_DIGESTS digest files are kept and older ones deleted. stdout, logs, the run row in
 // data/dispatcher.db, the healthcheck ping and data/digest-state.json hold counts and timestamps only.
 //
-// Usage: node src/digest/run.js [--hours N] [--record] [--scheduled] [--deliver] [--no-model] [--reasoning]
-//        node src/digest/run.js --from <ISO time> --to <ISO time> [--mask-report]
-//   --from/--to    a fixed window (testing; never recorded as a success)
+// Usage: node src/digest/run.js [--hours N] [--record] [--scheduled] [--deliver] [--refresh] [--no-model] [--reasoning]
+//        node src/digest/run.js --from <ISO time> --to <ISO time> [--scheduled | --deliver] [--mask-report]
+//   --from/--to    a fixed window (testing; never recorded as a success, even with --scheduled or --record)
+//   --hours N      the last N hours (testing; never recorded either)
 //   --deliver      also send the Slack DM on a hand run (scheduled runs always do)
+//   --refresh      also refresh the conversation list first on a hand run (scheduled runs always do)
 //   --mask-report  no digest: print which masking pattern fired on which message (pattern name, conversation ID,
 //                  message timestamp), never any text
 const fs = require('node:fs');
 const path = require('node:path');
 const { parseArgs } = require('node:util');
-const { ROOT, DATA_DIR, CHANNELS_FILE, createClient, loadConfig, placeChannel, localDay } = require('../slack');
+const { ROOT, DATA_DIR, CHANNELS_FILE, createClient, loadConfig, placeChannel, localDay, listConversations, applyListing, writePrivateJson } = require('../slack');
 const { fetchConversation } = require('./fetch');
 const { compressBots } = require('./compress');
-const { renderDigest, renderArchive, convLabel } = require('./render');
+const { renderDigest, renderArchive, convLabel, unmappedLabel } = require('./render');
 const { maskText, maskSecrets, newCounts, MASK_TYPES } = require('../mask');
 const { loadRoutes, createBudget, RETRY_CODES } = require('../openrouter');
 const { runPipeline } = require('./pipeline');
@@ -92,6 +101,27 @@ function pruneDigests() {
 // Counts per error code, e.g. { "rate-limited": 2 }.
 const tally = (codes) => codes.reduce((o, c) => ({ ...o, [c]: (o[c] ?? 0) + 1 }), {});
 
+// Daily membership refresh: re-list conversations (conversations.list only), update the saved list, and report
+// what changed. Returns { stats (counts only), newUnmapped: [label] }.
+async function refreshMembership(slack, bus, saved) {
+  const callsBefore = slack.stats.calls;
+  const listing = await listConversations(slack);
+  const r = applyListing(saved, listing);
+  const place = (c) => ({ ...c, ...placeChannel(bus, c) });
+  const next = { ...saved, refreshedAt: new Date().toISOString(), seen: { ...listing.seen, total: listing.raw.length },
+    member: { ...listing.member, total: listing.memberIds.size }, channels: r.channels.map(place) };
+  writePrivateJson(CHANNELS_FILE, next);
+  // Unmapped: no rule, override or group DM entry (an override set to null is a decision, not "unmapped").
+  const newUnmapped = r.added.map(place).filter((c) => c.by === null);
+  return {
+    saved: next,
+    newUnmapped: newUnmapped.map(unmappedLabel).sort(),
+    stats: { status: 'ok', listCalls: slack.stats.calls - callsBefore, conversations: r.channels.length, added: r.added.length,
+      addedMapped: r.added.length - newUnmapped.length, newUnmapped: newUnmapped.length, removed: r.removed.length,
+      removedMapped: r.removed.filter((c) => place(c).bu).length },
+  };
+}
+
 function readState() {
   try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch { return null; }
 }
@@ -109,12 +139,14 @@ function readState() {
     record: { type: 'boolean', default: false },
     scheduled: { type: 'boolean', default: false },
     deliver: { type: 'boolean', default: false },
+    refresh: { type: 'boolean', default: false },
   } });
   const source = opts.scheduled ? 'launchd-direct' : 'manual';
   // Scheduled runs keep the log to stats: no per-conversation progress lines.
   const progress = (line) => { if (!opts.scheduled) process.stderr.write(line); };
   const fixedWindow = Boolean(opts.from || opts.to);
-  const record = (opts.record || opts.scheduled) && !fixedWindow && !opts['mask-report'];
+  // An explicit window (--from/--to or --hours) is a test and never moves the last-success record.
+  const record = (opts.record || opts.scheduled) && !fixedWindow && !opts.hours && !opts['mask-report'];
   const { logRun } = require('../db');
   // servedBy names the model and provider that wrote the digest; phase 1 is code only.
   const useModel = !opts['no-model'] && !opts['mask-report'];
@@ -132,7 +164,7 @@ function readState() {
       status: summary.status, ...pick('error'), ...pick('windowHours'), servedBy: summary.servedBy,
       ...pick('fallbacks'), ...pick('fallbackReasons'), ...pick('retries'), ...pick('retryReasons'),
       ...pick('customersMerged'), ...pick('customersNotable'), ...pick('itemsKept'), ...pick('itemsDropped'), ...pick('itemsDroppedBy'), ...pick('notSummarizedCap'),
-      ...pick('costUsd'), runtimeS: summary.runtimeS, delivery: summary.delivery ?? { status: 'not attempted' },
+      ...pick('costUsd'), ...pick('membership'), runtimeS: summary.runtimeS, delivery: summary.delivery ?? { status: 'not attempted' },
     });
     try {
       await ping(JOB, failed, body);
@@ -168,7 +200,20 @@ function readState() {
   try {
     const bus = loadConfig();
     if (!fs.existsSync(CHANNELS_FILE)) throw new Error('data/slack-channels.json not found; run node scripts/slack-channels.js first');
-    const saved = JSON.parse(fs.readFileSync(CHANNELS_FILE, 'utf8'));
+    let saved = JSON.parse(fs.readFileSync(CHANNELS_FILE, 'utf8'));
+    const slack = createClient();
+    let newUnmapped = [];
+    if (opts.scheduled || opts.refresh) {
+      progress('Refreshing the conversation list...\n');
+      try {
+        const r = await refreshMembership(slack, bus, saved);
+        saved = r.saved;
+        newUnmapped = r.newUnmapped;
+        summary.membership = r.stats;
+      } catch (e) {
+        summary.membership = { status: 'failed', code: e.code ?? 'error' }; // carry on with the saved list
+      }
+    }
     const targets = saved.channels.map((c) => ({ ...c, ...placeChannel(bus, c) })).filter((c) => c.bu);
 
     // Window
@@ -201,7 +246,6 @@ function readState() {
     const lookbackStart = windowStart - cfg.threadLookbackDays * 86_400;
     Object.assign(summary, { windowHours: Number(window.hours.toFixed(2)), conversations: targets.length });
 
-    const slack = createClient();
     progress('Loading user names...\n');
     const users = await slack.paginate('users.list', { limit: '200' }, 'members');
     const names = new Map(users.map((u) => [u.id, u.profile?.display_name || u.real_name || u.name]));
@@ -341,6 +385,8 @@ function readState() {
         `$${budget.used.costUsd.toFixed(4)}`,
         `window ${window.hours.toFixed(1)} h`,
         ...(registry.unmatched.length ? [`${registry.unmatched.length} unmatched channels`] : []),
+        ...(newUnmapped.length ? [`${newUnmapped.length} new, unmapped: ${newUnmapped.slice(0, 15).join(', ')}${newUnmapped.length > 15 ? ` and ${newUnmapped.length - 15} more` : ''}`] : []),
+        ...(summary.membership?.status === 'failed' ? ['membership refresh failed'] : []),
       ];
     }
 
@@ -359,6 +405,9 @@ function readState() {
         `- Would send to a model: about ${wouldSendTokens.toLocaleString('en-US')} tokens before prompts; run cap ${cfg.maxRunInputTokens.toLocaleString('en-US')}${summary.underCap ? '' : ' (over the cap: the quietest calls would not be summarized)'}.`,
         `- Masking dry run (secrets in every conversation, the rest in external ones): ${MASK_TYPES.map((t) => `${t} ${maskCounts[t]}`).join(', ')}. Nothing was sent.`,
       ]),
+      ...(summary.membership ? [summary.membership.status === 'ok'
+        ? `- Membership refresh: ${summary.membership.conversations} conversations; ${summary.membership.added} new (${summary.membership.addedMapped} mapped, ${summary.membership.newUnmapped} unmapped and not read${newUnmapped.length ? `: ${newUnmapped.join(', ')}` : ''}); ${summary.membership.removed} gone (${summary.membership.removedMapped} of them mapped).`
+        : `- Membership refresh failed (${summary.membership.code}); the saved conversation list was used.`] : []),
       `- Not sent to any model by choice (noCloud): ${totals.noCloudConversations} active ${totals.noCloudConversations === 1 ? 'conversation' : 'conversations'}.`,
       `- Slack API calls: ${s.calls}, rate-limit waits: ${s.rateLimited}. Runtime: ${Math.round((Date.now() - started) / 1000)} s.`,
     ];

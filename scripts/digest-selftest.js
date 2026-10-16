@@ -97,12 +97,12 @@ for (const [name, input, want, wantCounts] of MASK_CASES) {
   // External = in an external unit and the name lacks an internal prefix; Slack's shared flag does not count.
   const { placeChannel } = require('../src/slack');
   const cfg = { rules: [], overrides: {}, groupDms: { G1: { bu: 'Unit B', sub: null } }, pendingGroupDms: [],
-    external: { units: ['Unit B'], internalPrefixes: ['success-', 'bas'] } };
+    external: { units: ['Unit B'], internalPrefixes: ['success-', 'grp'] } };
   cfg.rules = [{ bu: 'Unit B', sub: null, label: 'r', test: () => true }];
   const ext = (name, extra = {}) => placeChannel(cfg, { id: 'C1', name, type: 'public', ...extra }).external;
   check('external: customer channel in the external unit is external', ext('acme-coordination') === true);
   check('external: success- prefix is internal', ext('success-acme') === false);
-  check('external: bas prefix is internal', ext('bas-team-notes') === false && ext('Basement-ops') === false);
+  check('external: a second internal prefix is internal, case-insensitive', ext('grp-team-notes') === false && ext('Grpwork-ops') === false);
   check('external: Slack shared flag alone does not make it external', ext('success-acme', { isExtShared: true }) === false);
   check("external: the unit's group DMs are external", placeChannel(cfg, { id: 'G1', name: 'mpdm-a--b-1', type: 'group_dm' }).external === true);
   const other = { ...cfg, rules: [{ bu: 'Unit A', sub: null, label: 'r', test: () => true }] };
@@ -394,7 +394,7 @@ const hang = (init) => new Promise((_, reject) => {
       if (n === 1) return { route: 'primary', model: 'm', provider: 'P', json: { points: 'nope' }, usage: {}, costUsd: 0 };
       const e = new Error('cap'); e.code = 'cost-cap'; throw e;
     };
-    const out = await analyzeAll(jobs, { routes: {}, budget: null, maskCounts: newCounts(), concurrency: 1, chatImpl: stub });
+    const out = await analyzeAll(jobs, { routes: {}, budget: null, maskCounts: newCounts(), concurrency: 1, startGapMs: 0, chatImpl: stub });
     check('validate: bad shape fails one job; a cost cap stops the rest without calling',
       out[0].error === 'bad-shape' && out[1].error === 'cost-cap' && out[2].error === 'not sent: cost-cap' && n === 2, JSON.stringify(out.map((o) => o.error)));
   }
@@ -433,6 +433,21 @@ const hang = (init) => new Promise((_, reject) => {
     const m = (t) => mentionedCustomers(t, reg).sort().join();
     check('mentions: whole-word, case-insensitive, hyphen or space or nothing between words',
       m('Is ACME-Corp ok?') === 'acmecorp' && m('acmecorp renewal') === 'acmecorp' && m('Birch is unhappy') === 'birchhealth' && m('birchwood trees') === '' && m('the acme corporation') === '', [m('Is ACME-Corp ok?'), m('birchwood trees'), m('the acme corporation')].join('|'));
+  }
+  // Configured customers without a success channel, case-sensitive aliases, mention matching switched off, and the
+  // "other" bucket for customer-unit conversations that are not customers.
+  const REG_CFG2 = { ...REG_CFG, customers: { ...REG_CFG.customers, ash: { name: 'ASH', exactAliases: ['ASH'] }, zenith: { name: 'Zenith' } },
+    otherBucket: { name: 'Other B', channels: new Set(['G1']) }, noMention: new Set(['acme corp']) };
+  {
+    const reg = buildRegistry(REG_CONVS, REG_CFG2);
+    const cust = (k) => reg.customers.find((c) => c.key === k);
+    check('registry: a configured customer with no success channel collects its channels by key and is not unmatched',
+      JSON.stringify(cust('zenith')?.convIds) === '["X4","X5"]' && !cust('zenith').unmatched && reg.unmatched.length === 0, JSON.stringify(reg.unmatched.map((u) => u.conv.id)));
+    check('registry: other-bucket conversations are neither customers nor unmatched',
+      reg.other?.name === 'Other B' && reg.other.convIds.has('G1') && !reg.byConv.has('G1') && !reg.customers.some((c) => c.convIds.includes('G1')));
+    const m = (t) => mentionedCustomers(t, reg).sort().join();
+    check('mentions: exact-case aliases match only in that case, whole word', m('ASH called about invoices') === 'ash' && m('the ash tree') === '' && m('ASHFORD office') === '', [m('the ash tree'), m('ASHFORD office')].join('|'));
+    check('mentions: an automatic alias in noMention is not matched (configured aliases still are)', m('acme corp renewal') === '' && m('Birch is unhappy') === 'birchhealth');
   }
 
   // ---------- The pipeline end to end, stubbed model (invented data) ----------
@@ -486,7 +501,7 @@ const hang = (init) => new Promise((_, reject) => {
     const log = [];
     const reg = buildRegistry(REG_CONVS, REG_CFG);
     const model = await runPipeline({ blocks: pipelineBlocks(), registry: reg, modes: MODES, me: ME, nameOf: (id) => `Person ${id}`, routes: {}, budget: null,
-      maskCounts: newCounts(), runCap: 400_000, callCap: 100_000, chatImpl: stubChat(log), ...extra });
+      maskCounts: newCounts(), runCap: 400_000, callCap: 100_000, startGapMs: 0, chatImpl: stubChat(log), ...extra });
     return { model, log };
   }
   {
@@ -563,8 +578,61 @@ const hang = (init) => new Promise((_, reject) => {
     check('caps: customers come before other calls', jobs.filter((j) => j.kind === 'unit').every((j) => j.capSkipped) || jobs.filter((j) => j.kind === 'customer').every((j) => !j.capSkipped));
     let sent = 0;
     const stub = async () => { sent++; return { route: 'primary', model: 'm', provider: 'P', json: { items: [], points: [] }, usage: {}, costUsd: 0 }; };
-    const out = await runAll(jobs, { routes: {}, budget: null, maskCounts: newCounts(), concurrency: 3, chatImpl: stub });
+    const out = await runAll(jobs, { routes: {}, budget: null, maskCounts: newCounts(), concurrency: 3, startGapMs: 0, chatImpl: stub });
     check('caps: skipped calls are never sent', sent === kept.length && out.filter((r) => r.capSkipped).length === plan.skippedCalls, `${sent} sent, ${kept.length} planned`);
+  }
+
+  {
+    // The "other" bucket: one brief call under its name, never a customer record.
+    const log = [];
+    const c = Object.fromEntries(REG_CONVS.map((x) => [x.id, x]));
+    const blocks = [...pipelineBlocks(), blk(c.G1, comp([hm('18.0', 'U7', 'Demo for a prospect went fine')]))];
+    const model = await runPipeline({ blocks, registry: buildRegistry(REG_CONVS, REG_CFG2), modes: MODES, me: ME, nameOf: (id) => `Person ${id}`, routes: {}, budget: null,
+      maskCounts: newCounts(), runCap: 400_000, callCap: 100_000, startGapMs: 0, chatImpl: stubChat(log) });
+    const other = model.units.find((u) => u.bu === 'Other B');
+    check('pipeline: the other bucket gets one brief summary under its name and no customer record',
+      other?.kind === 'brief' && other.points.length === 1 && !model.records.some((r) => r.convs.some((x) => x.id === 'G1')) && log.users.some((u) => u.includes('Unit: Other B.')));
+  }
+  {
+    // Model calls: at most 3 at once, and starts spaced by startGapMs.
+    const { analyzeAll: runAll } = require('../src/digest/analyze');
+    const starts = [];
+    let running = 0;
+    let peak = 0;
+    const stub = async () => {
+      starts.push(Date.now()); running++; peak = Math.max(peak, running);
+      await new Promise((r) => setTimeout(r, 120));
+      running--;
+      return { route: 'primary', model: 'm', provider: 'P', json: { items: [] }, usage: {}, costUsd: 0 };
+    };
+    const jobs = Array.from({ length: 6 }, (_, i) => ({ kind: 'customer', key: `K${i}`, header: 'Customer channel: #k.', messages: [{ conv: { id: 'K', external: false }, ts: '1.0', who: 'Invented Person', text: 'hello' }] }));
+    await runAll(jobs, { routes: {}, budget: null, maskCounts: newCounts(), concurrency: 3, startGapMs: 40, chatImpl: stub });
+    const gaps = starts.slice(1).map((t, i) => t - starts[i]);
+    check('calls: at most 3 at once, starts at least the gap apart', peak <= 3 && peak >= 2 && gaps.every((g) => g >= 35), JSON.stringify({ peak, gaps }));
+  }
+
+  // ---------- Daily membership refresh (invented IDs and names) ----------
+  {
+    const { applyListing, listConversations } = require('../src/slack');
+    const pages = [[{ id: 'C1', name: 'renamed-one', is_member: true, num_members: 4 }, { id: 'G9', name: 'mpdm-ann--bo-1', is_mpim: true, is_private: true }],
+      [{ id: 'C3', name: 'brand-new', is_member: true, num_members: 2 }, { id: 'C4', name: 'not-mine', is_member: false }, { id: 'P5', name: 'secret-room', is_private: true }]];
+    const calls = [];
+    const fake = { paginate: async (method, params) => { calls.push(method); return pages.flat(); } };
+    const listing = await listConversations(fake);
+    check('refresh: membership from conversations.list only; private and group DMs without is_member count as member',
+      calls.join() === 'conversations.list' && [...listing.memberIds].sort().join() === 'C1,C3,G9,P5' && listing.assumedMember === 2);
+    const saved = { scope: 'member', channels: [
+      { id: 'C1', name: 'old-one', type: 'public', lastActivity: '2026-01-01T00:00:00Z' },
+      { id: 'C2', name: 'left-this', type: 'public' },
+      { id: 'G9', name: 'mpdm-ann--bo-1', type: 'group_dm', memberNames: ['Ann', 'Bo'] }] };
+    const r = applyListing(saved, listing);
+    const byId = Object.fromEntries(r.channels.map((c) => [c.id, c]));
+    check('refresh: kept conversations keep saved details with the new name; new ones added; left ones dropped',
+      byId.C1?.name === 'renamed-one' && byId.C1.lastActivity === '2026-01-01T00:00:00Z' && byId.G9?.memberNames.join() === 'Ann,Bo'
+      && r.added.map((c) => c.id).sort().join() === 'C3,P5' && r.removed.map((c) => c.id).join() === 'C2' && !byId.C4 && byId.P5.type === 'private', JSON.stringify(r.channels.map((c) => c.id)));
+    const { unmappedLabel } = require('../src/digest/render');
+    check('refresh: new unmapped conversations are named by channel name or group DM handles',
+      unmappedLabel({ type: 'public', name: 'brand-new' }) === '#brand-new' && unmappedLabel({ type: 'group_dm', name: 'mpdm-ann--bo--cy-1' }) === 'DM: ann, bo, cy');
   }
 
   // ---------- Slack DM delivery: send-only client (invented IDs and text) ----------

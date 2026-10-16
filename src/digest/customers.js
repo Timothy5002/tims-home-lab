@@ -11,13 +11,16 @@
 //   dropWords        words removed from the name (company and filler words such as "coordination")
 //   minContainLength a key joins another when one contains the other and the shorter is at least this long
 //   minAliasLength   automatic aliases shorter than this are not used for mentions (set them by hand instead)
-//   customers        { key: { name?, aliases?: [...], channels?: [name or ID], keys?: [other derived keys] } }
+//   customers        { key: { name?, aliases?: [...], exactAliases?: [...], channels?: [name or ID], keys?: [other derived keys] } }
+//                    exactAliases match case-sensitively (for short upper-case names that are also ordinary words)
 //   notCustomers     [name or ID]  customer-source conversations that are general, not one customer's
+//   otherBucket      { name, channels: [name or ID] }  customer-source conversations that are not customers at all;
+//                    they get one brief summary under that name and are never ranked as customers
 //   noMention        [alias]  automatic aliases never used for mention matching
 //
 // Key: lower case, prefixes and suffixes stripped, split on "-", "_", "." and spaces, drop words removed, joined.
 // Matching is code only; mention matching is whole-word and case-insensitive, with "-", "_" or a space (or
-// nothing) allowed between an alias's words. It reads message text in memory and keeps nothing.
+// nothing) allowed between an alias's words; exactAliases are the same but case-sensitive. It reads message text in memory and keeps nothing.
 const fs = require('node:fs');
 const path = require('node:path');
 const { ROOT } = require('../slack');
@@ -39,6 +42,8 @@ function loadCustomerConfig(file = CONFIG) {
     minAliasLength: Number.isInteger(c.minAliasLength) ? c.minAliasLength : 4,
     customers: c.customers && typeof c.customers === 'object' ? c.customers : {},
     notCustomers: new Set(list('notCustomers')),
+    otherBucket: c.otherBucket && typeof c.otherBucket === 'object' && Array.isArray(c.otherBucket.channels)
+      ? { name: String(c.otherBucket.name ?? 'Other'), channels: new Set(c.otherBucket.channels.map(String)) } : null,
     noMention: new Set(list('noMention').map((s) => s.toLowerCase())),
   };
 }
@@ -59,22 +64,24 @@ const words = (name, cfg) => strip(name, cfg).split(/[-_.\s]+/).filter((w) => w 
 const deriveKey = (name, cfg) => words(name, cfg).join('');
 const titleCase = (ws) => ws.map((w) => (w.length <= 3 && /\d/.test(w) ? w : w[0].toUpperCase() + w.slice(1))).join(' ');
 
-// Whole-word, case-insensitive regex for an alias; its words may be joined by "-", "_", a space or nothing.
-function aliasRegex(alias) {
-  const parts = alias.toLowerCase().split(/[-_\s]+/).filter(Boolean).map((p) => p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-  return new RegExp(`(?<![\\p{L}\\p{N}])${parts.join('[-_\\s]?')}(?![\\p{L}\\p{N}])`, 'iu');
+// Whole-word regex for an alias; its words may be joined by "-", "_", a space or nothing. Case-insensitive unless
+// exact (exactAliases such as "ASH", which must not match the word "ash").
+function aliasRegex(alias, exact = false) {
+  const parts = (exact ? alias : alias.toLowerCase()).split(/[-_\s]+/).filter(Boolean).map((p) => p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  return new RegExp(`(?<![\\p{L}\\p{N}])${parts.join('[-_\\s]?')}(?![\\p{L}\\p{N}])`, exact ? 'u' : 'iu');
 }
 
 // convs: conversations with { id, name, type, bu, sub }. Returns the registry (names and IDs only, no text):
-// { customers: [{ key, name, aliases, convIds, anchors, unmatched? }], byConv: Map(convId -> key),
-//   unmatched: [conv], general: [conv], mentionConvs: Map(convId -> 'leadership' | 'internal'), regexes }
+// { customers: [{ key, name, aliases, exactAliases, convIds, unmatched? }], byConv: Map(convId -> key),
+//   unmatched: [conv], general: [conv], other: { name, convIds: Set } | null,
+//   mentionConvs: Map(convId -> 'leadership' | 'internal'), regexes }
 function buildRegistry(convs, cfg) {
   const isCustomerConv = (c) => cfg.customerSources.some((s) => inUnit(c, s));
   const isAnchor = (c) => cfg.anchorSources.some((s) => inUnit(c, s));
   const listed = (c, set) => set.has(c.id) || set.has(c.name);
   const customers = new Map();
   const ensure = (key, name) => {
-    if (!customers.has(key)) customers.set(key, { key, name, autoAliases: new Set(), aliases: new Set(), convIds: [], keys: new Set([key]) });
+    if (!customers.has(key)) customers.set(key, { key, name, autoAliases: new Set(), aliases: new Set(), exactAliases: new Set(), convIds: [], keys: new Set([key]) });
     return customers.get(key);
   };
   // Configured customers first (names, extra keys, aliases).
@@ -82,13 +89,16 @@ function buildRegistry(convs, cfg) {
     const c = ensure(key, v.name ?? null); // no name: the anchor channel's words name it, or else the key
     for (const k of v.keys ?? []) c.keys.add(String(k).toLowerCase());
     for (const a of v.aliases ?? []) c.aliases.add(String(a));
+    for (const a of v.exactAliases ?? []) c.exactAliases.add(String(a));
   }
   // Anchors: each success channel defines a customer.
   const byConv = new Map();
   const assign = (conv, cust) => { byConv.set(conv.id, cust.key); cust.convIds.push(conv.id); };
   const pending = [];
+  const otherIds = new Set();
   for (const conv of convs.filter(isCustomerConv)) {
     if (listed(conv, cfg.notCustomers)) continue;
+    if (cfg.otherBucket && listed(conv, cfg.otherBucket.channels)) { otherIds.add(conv.id); continue; }
     const explicit = Object.entries(cfg.customers).find(([, v]) => (v.channels ?? []).some((x) => x === conv.id || x === conv.name));
     if (explicit) { assign(conv, ensure(explicit[0], cfg.customers[explicit[0]].name ?? explicit[0])); continue; }
     if (isAnchor(conv) && conv.type !== 'group_dm') {
@@ -125,9 +135,9 @@ function buildRegistry(convs, cfg) {
     assign(u.conv, cust);
   }
   // Aliases for mentions: configured ones, plus the automatic ones (the success channel's words), minus noMention.
-  const list = [...customers.values()].filter((c) => c.convIds.length || c.aliases.size).map((c) => {
+  const list = [...customers.values()].filter((c) => c.convIds.length || c.aliases.size || c.exactAliases.size).map((c) => {
     const aliases = [...new Set([...c.aliases, ...[...c.autoAliases].filter((a) => !cfg.noMention.has(a.toLowerCase()))])];
-    return { key: c.key, name: c.name ?? c.key, aliases, convIds: c.convIds, unmatched: Boolean(c.unmatched) };
+    return { key: c.key, name: c.name ?? c.key, aliases, exactAliases: [...c.exactAliases], convIds: c.convIds, unmatched: Boolean(c.unmatched) };
   }).sort((a, b) => a.name.localeCompare(b.name));
   const mentionConvs = new Map();
   for (const conv of convs) {
@@ -135,8 +145,9 @@ function buildRegistry(convs, cfg) {
     if (src && !byConv.has(conv.id)) mentionConvs.set(conv.id, src.leadership ? 'leadership' : 'internal');
   }
   const general = convs.filter((c) => isCustomerConv(c) && listed(c, cfg.notCustomers));
-  const regexes = list.filter((c) => !c.unmatched).map((c) => ({ key: c.key, res: c.aliases.map(aliasRegex) }));
-  return { customers: list, byConv, unmatched, general, mentionConvs, regexes };
+  const regexes = list.filter((c) => !c.unmatched).map((c) => ({ key: c.key, res: [...c.aliases.map((a) => aliasRegex(a)), ...c.exactAliases.map((a) => aliasRegex(a, true))] }));
+  const other = cfg.otherBucket ? { name: cfg.otherBucket.name, convIds: otherIds } : null;
+  return { customers: list, byConv, unmatched, general, other, mentionConvs, regexes };
 }
 
 // Keys of the customers a message text mentions (whole-word aliases). Text is only tested, never kept.

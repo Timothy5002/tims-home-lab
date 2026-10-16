@@ -12,7 +12,7 @@
 //                busiest first within each; a call over the per-call cap keeps its newest messages; whatever does
 //                not fit is marked "not summarized (cap)" instead of aborting the run.
 //   analyzeAll(): runs the calls through src/openrouter.js (primary, one primary retry, one fallback) at most 3 at
-//                a time, under the run's input, output and cost caps.
+//                a time, starts at least 1.5 s apart, under the run's input, output and cost caps.
 //   synthesisJob(): builds the stage-2 call for one customer from its stage-1 findings and its mentions.
 // Call kinds: customer (stage 1, one conversation), synth (stage 2, one customer), unit (full-mode sub-group),
 // brief (brief-mode unit), incident (off-mode unit). Nothing here logs or stores message text or model text.
@@ -21,6 +21,7 @@ const { maskText, maskSecrets } = require('../mask');
 const P = require('./prompts');
 
 const MAX_MESSAGE_CHARS = 2000;  // a single very long message is cut before sending
+const START_GAP_MS = 1500;       // least time between two model-call starts (at most 3 run at once)
 const SUMMARY_CHARS = 200;
 const HEADLINE_WORDS = 20;
 const BRIEF_WORDS = 12;
@@ -221,10 +222,18 @@ function userPrompt(job, lines) {
 
 // jobs: [{ kind, key, header, messages, findings?, capSkipped? }]. Returns one result per job:
 // { key, kind, ok, refMap, ...validated fields, drops, dropped, route, model, provider, fellBack, retried, error }.
-async function analyzeAll(jobs, { routes, budget, maskCounts, reasoning = false, concurrency = 3, chatImpl = chat, onDone = () => {} }) {
+// At most `concurrency` calls run at once, and two call starts are at least startGapMs apart, so a burst of three
+// does not hit the provider in the same instant (skipped calls do not wait).
+async function analyzeAll(jobs, { routes, budget, maskCounts, reasoning = false, concurrency = 3, startGapMs = START_GAP_MS, chatImpl = chat, onDone = () => {} }) {
   const results = new Array(jobs.length);
   let next = 0;
   let stopCode = null; // a run-level cap stops the remaining calls
+  let nextStart = 0;   // earliest time the next call may start
+  const waitTurn = async () => {
+    const at = Math.max(Date.now(), nextStart);
+    nextStart = at + startGapMs; // reserved before awaiting, so workers queue in order
+    if (at > Date.now()) await new Promise((r) => setTimeout(r, at - Date.now()));
+  };
   async function worker() {
     while (next < jobs.length) {
       const i = next++;
@@ -234,6 +243,8 @@ async function analyzeAll(jobs, { routes, budget, maskCounts, reasoning = false,
       if (job.capSkipped) { results[i] = { ...base, ok: false, capSkipped: true, error: 'not summarized (cap)' }; onDone(results[i]); continue; }
       const { lines, refMap } = prepare(job.messages, maskCounts, job.kind === 'synth' ? 's' : 'm');
       base.refMap = refMap;
+      if (stopCode) { results[i] = { ...base, ok: false, error: `not sent: ${stopCode}` }; onDone(results[i]); continue; }
+      await waitTurn();
       if (stopCode) { results[i] = { ...base, ok: false, error: `not sent: ${stopCode}` }; onDone(results[i]); continue; }
       try {
         const r = await chatImpl({ routes, budget, reasoning, system: KINDS[job.kind].system, user: userPrompt(job, lines), maxTokens: KINDS[job.kind].maxTokens });
@@ -258,5 +269,5 @@ async function analyzeAll(jobs, { routes, budget, maskCounts, reasoning = false,
 
 module.exports = {
   prepare, validate, sanitize, analyzeAll, planJobs, estimateJob, synthesisJob, isCapped, cutWords, newDrops,
-  ShapeError, EVIDENCE, LEVEL_RANK, KINDS,
+  ShapeError, EVIDENCE, LEVEL_RANK, KINDS, START_GAP_MS,
 };

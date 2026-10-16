@@ -6,6 +6,8 @@
 //      - other full-mode sub-groups: one unit summary each (archive file only)
 //      - brief-mode units: one call per unit, at most 3 one-line items
 //      - off-mode units: one incident check per unit (only an outage or incident that affects customers)
+//      - the registry's "other" bucket (customer-unit conversations that are not customers): one brief call under
+//        the bucket's name, at most 3 one-line items, never a customer record
 //      Conversations where the user is the main poster are left out of unit and brief summaries (counted).
 //      noCloud conversations are never sent anywhere, including as mentions.
 //   2. Find customer mentions in the mention channels (Leadership, Internal) by alias, in code.
@@ -44,7 +46,8 @@ const addDrops = (into, d) => { for (const k of Object.keys(into)) into[k] += d?
 const resolve = (refs, refMap) => refs.map((r) => refMap.get(r));
 
 // blocks: [{ conv: { id, label, bu, sub, external, noCloud }, compressed, error }]; registry from buildRegistry().
-async function runPipeline({ blocks, registry, modes, me, nameOf, routes, budget, maskCounts, runCap, callCap, reasoning = false, chatImpl, onDone = () => {} }) {
+// startGapMs: the least time between the starts of two model calls (src/digest/analyze.js).
+async function runPipeline({ blocks, registry, modes, me, nameOf, routes, budget, maskCounts, runCap, callCap, reasoning = false, startGapMs, chatImpl, onDone = () => {} }) {
   const skipped = { quietConversations: 0, botPosts: 0, ownConversations: 0, noCloudConversations: 0, ...newDrops() };
   const active = [];
   for (const b of blocks) {
@@ -62,6 +65,13 @@ async function runPipeline({ blocks, registry, modes, me, nameOf, routes, budget
   for (const b of active) {
     const mode = modeOf(modes, b.conv);
     const custKey = registry.byConv.get(b.conv.id);
+    if (registry.other?.convIds.has(b.conv.id)) {
+      if (mainlyMine(b, me)) { skipped.ownConversations++; continue; }
+      const k = `brief:${registry.other.name}`;
+      if (!unitGroups.has(k)) unitGroups.set(k, { kind: 'brief', bu: registry.other.name, sub: null, blocks: [] });
+      unitGroups.get(k).blocks.push(b);
+      continue;
+    }
     if (custKey && mode !== 'off') {
       const cust = customerName.get(custKey);
       stage1.push({ kind: 'customer', key: b.conv.id, custKey, block: b,
@@ -101,7 +111,7 @@ async function runPipeline({ blocks, registry, modes, me, nameOf, routes, budget
 
   // 3. Stage 1 under the caps.
   const plan = planJobs(stage1, { runCap: Math.floor(runCap * (1 - SYNTH_RESERVE)), callCap });
-  const r1 = await analyzeAll(stage1, { routes, budget, maskCounts, reasoning, chatImpl, onDone });
+  const r1 = await analyzeAll(stage1, { routes, budget, maskCounts, reasoning, startGapMs, chatImpl, onDone });
 
   // 4. Stage 2 per customer.
   const byCustomer = new Map();
@@ -119,7 +129,7 @@ async function runPipeline({ blocks, registry, modes, me, nameOf, routes, budget
     synthJobs.push(synthesisJob(customerName.get(key), ok.map((x) => ({ result: x.result, messages: x.job.messages })), mentions.get(key) ?? []));
   }
   // Stage 2 re-sends text already counted, so its masking counts go to a throwaway counter.
-  const r2 = synthJobs.length ? await analyzeAll(synthJobs, { routes, budget, maskCounts: { email: 0, phone: 0, number: 0, url: 0, secret: 0 }, reasoning, chatImpl, onDone }) : [];
+  const r2 = synthJobs.length ? await analyzeAll(synthJobs, { routes, budget, maskCounts: { email: 0, phone: 0, number: 0, url: 0, secret: 0 }, reasoning, startGapMs, chatImpl, onDone }) : [];
   const synthBy = new Map(synthJobs.map((j, i) => [j.key, r2[i]]));
 
   // Records: one per customer with activity or mentions.
