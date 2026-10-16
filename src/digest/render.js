@@ -138,7 +138,9 @@ function renderArchive({ model, window, footer, ctx }) {
   for (const r of notable) {
     const flags = [r.severity.toUpperCase(), r.leadership ? 'also discussed in Leadership' : null, r.merged ? null : `not merged (${r.synthError ?? 'no synthesis'}); stage-1 findings shown`, r.unmatched ? 'unmatched channel' : null].filter(Boolean);
     out.push('', `### ${r.name} (${flags.join(' · ')})`);
-    out.push(`**${r.headline}**`);
+    // The headline check (src/digest/pipeline.js): softened and dropped headlines are marked here only, never in the DM.
+    if (r.headlineDropped) out.push('_Headline dropped: the messages it cited did not support it._');
+    else out.push(`**${r.headline}**${r.softened ? ' (softened)' : ''}${r.verify === 'failed' ? ' (not checked: the check failed)' : ''}`);
     for (const p of r.points) out.push(pointLine(p, ctx));
     out.push(`Channels: ${r.convs.map((c) => `${c.label} (${c.messages}${c.status === 'ok' ? '' : `, ${c.status === 'cap' ? 'not summarized: cap' : `failed: ${c.error}`}`}${c.trimmed ? `, oldest ${c.trimmed} not read` : ''})`).join(', ') || 'none active'}${r.mentions ? `; mentions: ${r.mentions} (${r.leadershipMentions} in Leadership)` : ''}`);
   }

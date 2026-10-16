@@ -25,12 +25,13 @@ const ops = conv('team-ops');
 const growth = conv('team-growth');
 
 const itemsOf = (r) => [...(r.items ?? []), ...(r.points ?? []), ...(r.incident ? [r.incident] : [])];
-const allText = (r) => [r.headline ?? '', ...itemsOf(r).map((i) => i.summary)].join(' ').toLowerCase();
+const allText = (r) => [r.headline ?? '', r.short ?? '', ...itemsOf(r).map((i) => i.summary)].join(' ').toLowerCase();
 const citesAny = (r, refs) => itemsOf(r).some((i) => i.refs.some((x) => refs.includes(x)));
 const gamma = conv('success-gamma');
 const lead = conv('leadership');
 const eng = conv('eng');
 const salesA = conv('unit-a-sales');
+const hazel = conv('hazel-coordination');
 
 const CASES = [
   {
@@ -116,7 +117,54 @@ const CASES = [
       { summary: 'Inbound calls failed from 8am.', kind: 'problem', severity: 'high', category: 'incident', refs: ['s001'] },
       { summary: 'Customer is reviewing options before renewal after a second outage.', kind: 'risk', severity: 'high', category: 'commercial', refs: ['s002'] },
     ] },
-    expect: (r) => r.notable && r.severity === 'high' && r.headline.split(' ').length <= 20 && r.leadership && /call|outage|renewal|option/.test(allText(r)),
+    expect: (r) => r.notable && r.severity === 'high' && r.headline.split(' ').length <= 20 && r.short && r.short.split(' ').length <= 12 && !r.short.endsWith('…')
+      && r.leadership && /call|outage|renewal|option/.test(allText(r)),
+  },
+  {
+    name: 'certainty: a reported intention stays an intention, attributed',
+    job: { kind: 'customer', key: 'hazel', header: 'Customer: Hazel. Channel #hazel-coordination.', messages: [
+      msg(hazel, 0, 'Delaine', 'Heads up: their ops lead told me on a call that Hazel is considering moving to Rivalco next quarter.'),
+      msg(hazel, 15, 'Riley', 'Ugh. Do we know why?'),
+      msg(hazel, 20, 'Delaine', 'Pricing, I think. Nothing decided yet.'),
+    ] },
+    expect: (r) => r.notable && /consider|evaluat|looking|may|might|weigh|explor/.test(allText(r)) && !/\bsigned\b|\bswitched\b|has moved|have moved|is leaving|will leave|churned/.test(allText(r))
+      && /delaine|per |reported|told|said/.test(allText(r)),
+  },
+  {
+    name: 'certainty: synthesis does not upgrade "considering" to "signed"',
+    job: { kind: 'synth', key: 'hazel', customer: { name: 'Hazel' }, messages: [
+      msg(hazel, 0, 'Delaine', 'Their ops lead told me Hazel is considering Rivalco for next quarter. Nothing signed.'),
+      msg(conv('success-hazel'), 40, 'Morgan (Hazel)', 'Can we get the pricing comparison you promised by Friday?'),
+    ], findings: [
+      { summary: 'Hazel signed with Rivalco.', kind: 'risk', severity: 'high', category: 'commercial', refs: ['s001'] },
+      { summary: 'Customer asked for the promised pricing comparison by Friday.', kind: 'risk', severity: 'medium', category: 'deadline', refs: ['s002'] },
+    ] },
+    expect: (r) => r.notable && /consider|evaluat|looking|weigh|explor/.test(allText(r)) && !/\bsigned with\b|\bhas signed\b|\bsigned a\b/.test(allText(r).replace(/nothing signed|not signed|no(t)? (yet )?signed/g, ''))
+      && r.short && r.short.split(' ').length <= 12,
+  },
+  {
+    name: 'check: "considering X" stated as "signed with X" is overstated and corrected',
+    job: { kind: 'verify', key: 'hazel', customer: { name: 'Hazel' }, headline: 'Hazel signed with Rivalco and is leaving next quarter.', short: 'Hazel signed with Rivalco, leaving', messages: [
+      msg(hazel, 0, 'Delaine', 'Their ops lead told me Hazel is considering Rivalco for next quarter. Nothing decided.'),
+    ] },
+    expect: (r) => r.verdict === 'overstated' && !/\bsigned\b/.test(`${r.headline} ${r.short}`.toLowerCase()) && /consider|evaluat|weigh|explor|looking/.test(`${r.headline} ${r.short}`.toLowerCase())
+      && r.short.split(' ').length <= 12,
+  },
+  {
+    name: 'check: a headline the messages state is supported',
+    job: { kind: 'verify', key: 'acme', customer: { name: 'Acme' }, headline: 'Inbound calls failed for about two hours this morning; Acme says bookings were lost.', short: 'Calls failed two hours; Acme lost bookings', messages: [
+      msg(acme, 0, 'Jordan (Acme)', 'Inbound calls have been failing since 8am, we lost bookings all morning.'),
+      msg(acme, 125, 'Riley', 'Restored at 10:05, about two hours of failures.'),
+    ] },
+    expect: (r) => r.verdict === 'supported',
+  },
+  {
+    name: 'check: a headline the messages do not support is unsupported',
+    job: { kind: 'verify', key: 'birch', customer: { name: 'Birch' }, headline: 'Birch is cancelling over repeated billing errors.', short: 'Birch cancelling over billing errors', messages: [
+      msg(birch, 0, 'Morgan (Birch)', 'Can we move Thursday\'s check-in to 3pm?'),
+      msg(birch, 10, 'Riley', 'Sure, updated the invite.'),
+    ] },
+    expect: (r) => r.verdict === 'unsupported',
   },
   {
     name: 'brief unit: at most 3 short items',

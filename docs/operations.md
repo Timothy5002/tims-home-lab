@@ -35,6 +35,8 @@ curl -s 127.0.0.1:11434/api/ps                                             # is 
 node scripts/slack-channels.js && node scripts/slack-measure.js            # Slack volume; see docs/slack-measurement.md
 launchctl kickstart -k gui/$(id -u)/com.lab.schedule.slack-digest          # run the Slack digest now (records, delivers, pings)
 node src/digest/run.js --scheduled --from <ISO> --to <ISO>                 # test the scheduled path on a fixed window (delivers, pings, never records)
+node scripts/digest-map.js list-unmapped                                   # conversations the digest does not read (no rule, not ignored)
+node scripts/digest-map.js map <name> <Unit>[/<Sub-group>]                 # map one; also: map-customer, ignore, remove (see docs/slack-digest.md)
 tail -n 60 ~/Library/Logs/lab-dispatcher/schedule-slack-digest.log         # digest stats (never message text)
 node scripts/digest-dm-test.js                                             # send one invented line to your DM; prints stats
 node scripts/digest-selftest.js                                            # digest guard tests (no network)
@@ -56,8 +58,9 @@ After editing a file in `launchd/`, reinstall it with `scripts/install-agent.sh 
 | `disk-check` lists `Library`, `Documents` etc. as unreadable | Expected. Jobs run under launchd's `node`, which macOS privacy does not let into protected folders, and Full Disk Access is deliberately not granted. Free space is still exact; only the folder list is incomplete |
 | Nothing runs after a reboot | Auto-login is off, or the agent isn't installed in `~/Library/LaunchAgents/` |
 | Digest healthcheck is down, log says `delivery-failed` | The digest file was still written, and the last success did not move, so the next run covers the window again. The `delivery.code` in the log is Slack's error code: `missing_scope` (add the scope in the Slack app and reinstall it), `invalid_auth` or `bot-token` (check `~/.lab/slack-bot-token`, mode 600), `dm-mismatch` (Slack returned a DM that is not yours; nothing was posted), `thread-not-posted` (the top message went out but the reply failed) |
-| The DM thread's footer says "N new, unmapped: …" | You joined conversations that match no rule in `config/slack-bus.json`; they were not read. Add a rule or an override (or a `groupDms` entry by ID), or leave them out. They are named only once |
+| The last DM reply's footer says "N unmapped: …" | Conversations you are in that match no rule in `config/slack-bus.json`; they were not read. `node scripts/digest-map.js list-unmapped` shows them all; `map` or `ignore` each one. They are listed every run until you do |
 | The DM thread's footer says "membership refresh failed" | `conversations.list` failed (Slack down or the user token); the digest used yesterday's saved list. Check `~/.lab/slack-token` |
 | A customer's channels show up as separate records, or "unmatched channels" grows | Run `node scripts/digest-customers.js`, then add extra `keys`, `aliases` or hand-assigned `channels` (or `notCustomers`) in `config/digest-customers.json` |
 | Digest log says `not summarized (cap)` or the footer counts calls over the cap | The window held more than the 400k-token run cap (for example after several missed days); the busiest customers were summarized and the rest listed with counts |
-| Digest ran but the healthcheck shows `/fail` with `deadline` | The run passed 25 minutes; usually Slack rate limits. No digest was written and the last success did not move |
+| Digest ran but the healthcheck shows `/fail` with `deadline` | The run passed 60 minutes; usually Slack rate limits. No digest was written and the last success did not move. The log's `timing` shows which phase was slow |
+| The archive file shows "(softened)" or "Headline dropped" | The headline check found the synthesis overstated (corrected text shown) or unsupported (dropped) against the messages it cited. The DM shows only the checked text |

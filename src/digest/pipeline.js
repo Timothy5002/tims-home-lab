@@ -15,13 +15,22 @@
 //      then run it.
 //   4. Stage 2: one synthesis call per customer with findings or mentions, merging all its channels into one record.
 //      If it fails, the record falls back to the stage-1 findings, unmerged.
+//   5. Verification: for each customer that will be shown under "Needs attention" (the top 5 with medium or high
+//      severity), one cheap call checks the headline against ONLY the messages it cites. Overstated headlines are
+//      replaced by the corrected text (marked "softened" in the archive only); unsupported ones are dropped, and that
+//      customer is not shown under "Needs attention".
+// Extraction runs 2 calls at a time, synthesis and verification 3; with `verify` (the batch provider check), each
+// stage's served providers are checked in one batch after the stage. Phase times are returned in `timing`.
 // Returns records, unit lines, incidents, skipped counts and stats. No text is logged or stored here; the caller
 // renders the archive file and the DM from the returned items (validated, sanitized model text and code-built
 // evidence references).
-const { analyzeAll, planJobs, synthesisJob, isCapped, newDrops, LEVEL_RANK } = require('./analyze');
+const { analyzeAll, planJobs, synthesisJob, verifyJob, isCapped, newDrops, LEVEL_RANK, SHORT_WORDS } = require('./analyze');
 const { mentionedCustomers } = require('./customers');
 
 const SYNTH_RESERVE = 0.15; // share of the run cap kept for stage 2
+const NEEDS_ATTENTION = 5;  // customers shown under "Needs attention" in the DM, each with a checked headline
+const CONCURRENCY = { extraction: 2, synthesis: 3, verification: 3 };
+const words = (s) => String(s).split(' ').filter(Boolean).length;
 
 const modeOf = (modes, conv) => modes[`${conv.bu} > ${conv.sub ?? '-'}`] ?? modes[conv.bu] ?? 'brief';
 const count = (b) => b.compressed.stats.messagesIn;
@@ -46,8 +55,10 @@ const addDrops = (into, d) => { for (const k of Object.keys(into)) into[k] += d?
 const resolve = (refs, refMap) => refs.map((r) => refMap.get(r));
 
 // blocks: [{ conv: { id, label, bu, sub, external, noCloud }, compressed, error }]; registry from buildRegistry().
-// startGapMs: the least time between the starts of two model calls (src/digest/analyze.js).
-async function runPipeline({ blocks, registry, modes, me, nameOf, routes, budget, maskCounts, runCap, callCap, reasoning = false, startGapMs, chatImpl, onDone = () => {} }) {
+// startGapMs: the least time between the starts of two model calls (src/digest/analyze.js). verify: the batch
+// provider check (src/openrouter.js verifyGenerations); omitted in tests, where each stub call is its own check.
+async function runPipeline({ blocks, registry, modes, me, nameOf, routes, budget, maskCounts, runCap, callCap, reasoning = false, startGapMs, verify, concurrency = CONCURRENCY, chatImpl, onDone = () => {} }) {
+  const stage = (jobs, kind, counts = maskCounts) => analyzeAll(jobs, { routes, budget, maskCounts: counts, reasoning, startGapMs, verify, concurrency: concurrency[kind], chatImpl, onDone });
   const skipped = { quietConversations: 0, botPosts: 0, ownConversations: 0, noCloudConversations: 0, ...newDrops() };
   const active = [];
   for (const b of blocks) {
@@ -111,7 +122,7 @@ async function runPipeline({ blocks, registry, modes, me, nameOf, routes, budget
 
   // 3. Stage 1 under the caps.
   const plan = planJobs(stage1, { runCap: Math.floor(runCap * (1 - SYNTH_RESERVE)), callCap });
-  const r1 = await analyzeAll(stage1, { routes, budget, maskCounts, reasoning, startGapMs, chatImpl, onDone });
+  const r1 = await stage(stage1, 'extraction');
 
   // 4. Stage 2 per customer.
   const byCustomer = new Map();
@@ -129,8 +140,10 @@ async function runPipeline({ blocks, registry, modes, me, nameOf, routes, budget
     synthJobs.push(synthesisJob(customerName.get(key), ok.map((x) => ({ result: x.result, messages: x.job.messages })), mentions.get(key) ?? []));
   }
   // Stage 2 re-sends text already counted, so its masking counts go to a throwaway counter.
-  const r2 = synthJobs.length ? await analyzeAll(synthJobs, { routes, budget, maskCounts: { email: 0, phone: 0, number: 0, url: 0, secret: 0 }, reasoning, startGapMs, chatImpl, onDone }) : [];
+  const throwaway = () => ({ email: 0, phone: 0, number: 0, url: 0, secret: 0 });
+  const r2 = synthJobs.length ? await stage(synthJobs, 'synthesis', throwaway()) : Object.assign([], { meta: null });
   const synthBy = new Map(synthJobs.map((j, i) => [j.key, r2[i]]));
+  const synthJobBy = new Map(synthJobs.map((j) => [j.key, j]));
 
   // Records: one per customer with activity or mentions.
   const records = [];
@@ -148,10 +161,13 @@ async function runPipeline({ blocks, registry, modes, me, nameOf, routes, budget
     const s = synthBy.get(key);
     if (s?.ok) {
       addDrops(skipped, s.drops);
+      const sj = synthJobBy.get(key);
+      const byRef = new Map(sj.messages.map((m, i) => [`s${String(i + 1).padStart(3, '0')}`, m]));
       Object.assign(rec, {
-        merged: true, severity: s.severity, headline: s.headline, leadership: s.leadership,
+        merged: true, severity: s.severity, headline: s.headline, short: s.short, leadership: s.leadership,
         points: s.points.map((p) => ({ ...p, evidence: resolve(p.refs, s.refMap) })),
         best: s.bestRef ? s.refMap.get(s.bestRef) : null,
+        headlineMessages: s.headlineRefs.map((r) => byRef.get(r)).filter(Boolean), // for the check; never stored
       });
     } else {
       // Fallback: stage-1 findings, unmerged, strongest first.
@@ -160,13 +176,32 @@ async function runPipeline({ blocks, registry, modes, me, nameOf, routes, budget
         .sort((a, b) => LEVEL_RANK[a.severity] - LEVEL_RANK[b.severity]);
       rec.points = items;
       rec.severity = items[0]?.severity ?? null;
-      rec.headline = items[0] ? items[0].summary.split(' ').slice(0, 20).join(' ') : '';
+      // Never cut: the strongest finding stands as the headline, and as the short one only if it is short enough.
+      rec.headline = items[0]?.summary ?? '';
+      rec.short = items[0] && words(items[0].summary) <= SHORT_WORDS ? items[0].summary : '';
       rec.best = items[0]?.evidence[0] ?? null;
+      const msgs = list.flatMap((x) => x.job.messages);
+      rec.headlineMessages = (items[0]?.evidence ?? []).map((e) => msgs.find((m) => m.conv.id === e.conv && m.ts === e.ts)).filter(Boolean);
     }
     rec.notable = rec.points.length > 0;
     records.push(rec);
   }
   records.sort(rankRecords);
+
+  // 5. The headline check, for the customers "Needs attention" would show.
+  const candidates = records.filter((r) => r.notable && (r.severity === 'high' || r.severity === 'medium') && r.headline && r.headlineMessages?.length).slice(0, NEEDS_ATTENTION);
+  const verifyJobs = candidates.map((r) => verifyJob(r, r.headlineMessages));
+  const r3 = verifyJobs.length ? await stage(verifyJobs, 'verification', throwaway()) : Object.assign([], { meta: null });
+  const verification = { checked: r3.length, supported: 0, overstated: 0, unsupported: 0, failed: 0 };
+  candidates.forEach((rec, i) => {
+    const v = r3[i];
+    if (!v.ok) { rec.verify = 'failed'; verification.failed++; return; }
+    rec.verify = v.verdict;
+    verification[v.verdict]++;
+    if (v.verdict === 'overstated') Object.assign(rec, { headline: v.headline, short: v.short, softened: true });
+    if (v.verdict === 'unsupported') Object.assign(rec, { headline: '', short: '', headlineDropped: true });
+  });
+  for (const rec of records) delete rec.headlineMessages; // message text is not kept past this point
 
   // Units and incidents.
   const units = [];
@@ -187,16 +222,26 @@ async function runPipeline({ blocks, registry, modes, me, nameOf, routes, budget
   }
   // Customer incidents (medium or high) join the incident list.
   for (const rec of records) {
-    for (const p of rec.points) if (p.category === 'incident' && p.severity !== 'low') incidents.push({ source: rec.name, severity: p.severity, summary: p.summary, evidence: p.evidence });
+    for (const p of rec.points) if (p.category === 'incident' && p.severity !== 'low') incidents.push({ source: rec.name, customerKey: rec.key, severity: p.severity, summary: p.summary, evidence: p.evidence });
   }
   incidents.sort((a, b) => (LEVEL_RANK[a.severity ?? 'medium']) - (LEVEL_RANK[b.severity ?? 'medium']));
 
-  const all = [...r1, ...r2];
+  const all = [...r1, ...r2, ...r3];
+  const metas = [r1.meta, r2.meta, r3.meta].filter(Boolean);
   const capped = all.filter((r) => isCapped(r));
   return {
     records, units, incidents, skipped, results: all, plan,
+    timing: {
+      extractionMs: r1.meta?.modelMs ?? 0, synthesisMs: r2.meta?.modelMs ?? 0, verificationMs: r3.meta?.modelMs ?? 0,
+      providerCheckMs: metas.reduce((t, m) => t + m.providerCheckMs, 0),
+    },
+    providerChecks: {
+      checked: metas.reduce((t, m) => t + m.providerChecked, 0), mismatches: metas.reduce((t, m) => t + m.providerMismatches, 0),
+      reruns: metas.reduce((t, m) => t + m.reruns, 0),
+    },
     stats: {
-      calls: { stage1: r1.length, synthesis: r2.length },
+      verification,
+      calls: { stage1: r1.length, synthesis: r2.length, verification: r3.length },
       customersWithActivity: records.length,
       customersMerged: records.filter((r) => r.merged).length,
       customersNotable: records.filter((r) => r.notable).length,
@@ -217,4 +262,4 @@ function rankRecords(a, b) {
   return sev(a) - sev(b) || Number(b.leadership) - Number(a.leadership) || strong(b) - strong(a) || msgs(b) - msgs(a);
 }
 
-module.exports = { runPipeline, rankRecords, modeOf, mainlyMine, toMessages };
+module.exports = { runPipeline, rankRecords, modeOf, mainlyMine, toMessages, NEEDS_ATTENTION, CONCURRENCY };

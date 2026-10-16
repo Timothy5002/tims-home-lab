@@ -4,7 +4,7 @@
 // goes in the Authorization header.
 //
 // It can do exactly one thing: open the DM between the bot and ONE configured user, check that the DM belongs to
-// that user, then post a message into that DM and one threaded reply under it. Every other method or channel is
+// that user, then post a message into that DM and threaded replies under it (the digest sends up to 5). Every other method or channel is
 // refused in code. It never reads conversations, never uploads files, never listens to events, never replies to
 // anyone else, and never logs message text or the token. Scopes it needs: chat:write, im:write.
 const { readSecret } = require('./secrets');

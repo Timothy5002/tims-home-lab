@@ -5,13 +5,21 @@
 //
 // Two routes, each pinned to its own provider(s) with no OpenRouter fallbacks:
 //   primary   (config models.primary)   tried first; after a timeout, 5xx or 429 it is retried ONCE after a short
-//                                       backoff (RETRY_DELAY_MS, or Retry-After up to RETRY_MAX_MS)
+//                                       backoff (RETRY_DELAY_MS, or Retry-After up to RETRY_MAX_MS, plus up to
+//                                       RETRY_JITTER_MS of random jitter so parallel calls do not retry in step)
 //   secondary (config models.secondary) tried ONCE, only if the primary (after its retry, where one applies) timed
 //                                       out, returned 5xx or 429, or was served by a provider that is not pinned.
 // At most three requests per call (primary, primary retry, secondary); never two models in one request.
 // Every request: no tools; provider { order, only, allow_fallbacks: false, require_parameters: true,
 // data_collection: "deny" }; reasoning off (or the lowest level, for models that cannot turn it off) unless the
-// reasoning flag is set. After each reply the served provider is checked with OpenRouter's generation stats.
+// reasoning flag is set.
+//
+// Served-provider check, two sources: the reply's own "provider" field and OpenRouter's generation stats. By
+// default each call checks both before returning (the stats take about 15 s to appear; it waits up to about 30 s).
+// With deferStats (the digest), a call checks only the reply's field (a non-pinned name is a mismatch at once) and
+// returns; verifyGenerations() then reads the stats for a whole stage's calls in one batch, concurrently, with one
+// wait of up to about 30 s. The rule is the same either way: at least one source must name a provider, and every
+// source that names one must name a pinned provider; anything else is a mismatch.
 //
 // Costs come from OpenRouter (the generation's total cost); live endpoint prices are used for the pre-call
 // worst-case estimate that the per-run cost cap checks, and as the fallback when OpenRouter reports no cost.
@@ -24,6 +32,7 @@ const FALLBACK_CODES = new Set(['timeout', 'server-error', 'rate-limited', 'prov
 const RETRY_CODES = new Set(['timeout', 'server-error', 'rate-limited']); // transient: worth one more try on the primary
 const RETRY_DELAY_MS = 3000;
 const RETRY_MAX_MS = 10_000;
+const RETRY_JITTER_MS = 1000;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const estimateTokens = (s) => Math.ceil(String(s ?? '').length / 4);
@@ -133,6 +142,8 @@ function createBudget({ maxInputTokens = 400_000, maxOutputTokens = 60_000, maxC
       if (used.outputTokens + maxTokens > maxOutputTokens) throw new ModelError('output-cap', `output could reach ${used.outputTokens + maxTokens} tokens; cap ${maxOutputTokens}`);
       if (used.costUsd + worstCostUsd > maxCostUsd) throw new ModelError('cost-cap', `cost could reach $${(used.costUsd + worstCostUsd).toFixed(4)}; cap $${maxCostUsd}`);
     },
+    // The batch provider check may report the real cost after the call was counted with an estimate.
+    adjustCost(deltaUsd) { used.costUsd += deltaUsd; },
     add(usage, costUsd) {
       used.calls++;
       used.inputTokens += usage.prompt;
@@ -146,30 +157,68 @@ function createBudget({ maxInputTokens = 400_000, maxOutputTokens = 60_000, maxC
 // Which provider served a generation, and what it cost. The stats can take a while to appear after the reply,
 // so this waits up to about 30 s with growing gaps. Returns { provider, costUsd, tries: [HTTP status, ...] }.
 const STATS_DELAYS_MS = [1000, 2000, 3000, 4000, 5000, 6000, 8000]; // about 29 s in total
+
+// One look at a generation's stats. Returns { done, provider, costUsd, status }; done is false when waiting may help.
+async function statsOnce(id, { fetchImpl, key }) {
+  let res;
+  try {
+    res = await fetchImpl(`${BASE_URL}/generation?id=${encodeURIComponent(id)}`, {
+      headers: { Authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(15_000),
+    });
+  } catch {
+    return { done: false, provider: null, costUsd: null, status: 'network-error' };
+  }
+  if (res.ok) {
+    const d = (await res.json()).data ?? {};
+    if (d.provider_name) return { done: true, provider: d.provider_name, costUsd: Number.isFinite(d.total_cost) ? d.total_cost : null, status: res.status };
+    return { done: false, provider: null, costUsd: null, status: res.status };
+  }
+  // Auth or bad request: waiting will not help.
+  const done = res.status !== 404 && res.status !== 429 && res.status < 500;
+  return { done, provider: null, costUsd: null, status: res.status };
+}
+
 async function generationStats(id, { fetchImpl, key, sleepImpl }) {
   const tries = [];
   for (let i = 0; i <= STATS_DELAYS_MS.length; i++) {
-    let res;
-    try {
-      res = await fetchImpl(`${BASE_URL}/generation?id=${encodeURIComponent(id)}`, {
-        headers: { Authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(15_000),
-      });
-    } catch {
-      tries.push('network-error');
-      res = null;
-    }
-    if (res) {
-      tries.push(res.status);
-      if (res.ok) {
-        const d = (await res.json()).data ?? {};
-        if (d.provider_name) return { provider: d.provider_name, costUsd: Number.isFinite(d.total_cost) ? d.total_cost : null, tries };
-      } else if (res.status !== 404 && res.status !== 429 && res.status < 500) {
-        break; // auth or bad request: waiting will not help
-      }
-    }
+    const r = await statsOnce(id, { fetchImpl, key });
+    tries.push(r.status);
+    if (r.provider) return { provider: r.provider, costUsd: r.costUsd, tries };
+    if (r.done) break;
     if (i < STATS_DELAYS_MS.length) await sleepImpl(STATS_DELAYS_MS[i]);
   }
   return { provider: null, costUsd: null, tries };
+}
+
+// The provider rule, shared by the per-call and the batch check: at least one source names a provider, and every
+// source that does names a pinned one.
+const providerConfirmed = (named, pinned) => named.length > 0 && named.every((n) => pinned.includes(n));
+
+// Batch check for calls made with deferStats: reads every generation's stats concurrently (at most `parallel`
+// requests at a time), with one shared wait of up to about 30 s for the ones not yet available. items:
+// [{ id, replyProvider, pinnedNames }]. Returns one { ok, provider, statsProvider, costUsd } per item, in order.
+async function verifyGenerations(items, { fetchImpl = fetch, keyReader, sleepImpl = sleep, parallel = 6 } = {}) {
+  const key = (keyReader ?? (() => readSecret('openrouter-key')))();
+  const out = items.map(() => ({ statsProvider: null, costUsd: null }));
+  let pending = items.map((it, i) => (it.id ? i : -1)).filter((i) => i >= 0);
+  for (let round = 0; round <= STATS_DELAYS_MS.length && pending.length; round++) {
+    if (round > 0) await sleepImpl(STATS_DELAYS_MS[round - 1]);
+    const still = [];
+    for (let k = 0; k < pending.length; k += parallel) {
+      const chunk = pending.slice(k, k + parallel);
+      const rs = await Promise.all(chunk.map((i) => statsOnce(items[i].id, { fetchImpl, key })));
+      rs.forEach((r, j) => {
+        const i = chunk[j];
+        if (r.provider) Object.assign(out[i], { statsProvider: r.provider, costUsd: r.costUsd });
+        else if (!r.done) still.push(i);
+      });
+    }
+    pending = still;
+  }
+  return items.map((it, i) => {
+    const named = [it.replyProvider, out[i].statsProvider].filter(Boolean);
+    return { ok: providerConfirmed(named, it.pinnedNames ?? []), provider: out[i].statsProvider ?? it.replyProvider ?? null, ...out[i] };
+  });
 }
 
 // One attempt on one route. Throws ModelError; FALLBACK_CODES decide whether the secondary is tried.
@@ -224,13 +273,15 @@ async function attempt(route, opts, ctx) {
     reasoning: u.completion_tokens_details?.reasoning_tokens ?? 0,
     cached: u.prompt_tokens_details?.cached_tokens ?? 0,
   };
-  const stats = data.id ? await generationStats(data.id, { fetchImpl: ctx.fetchImpl, key: ctx.key, sleepImpl: ctx.sleepImpl }) : { provider: null, costUsd: null, tries: [] };
+  // Provider names from both sources: the reply's own "provider" field (if present) and the generation stats.
+  // With deferStats only the reply's field is read here; the stats are read later in a batch (verifyGenerations).
+  const replyProvider = typeof data.provider === 'string' ? data.provider : null;
+  const stats = data.id && !opts.deferStats ? await generationStats(data.id, { fetchImpl: ctx.fetchImpl, key: ctx.key, sleepImpl: ctx.sleepImpl }) : { provider: null, costUsd: null, tries: [] };
   const costUsd = stats.costUsd ?? (Number.isFinite(u.cost) ? u.cost : costFromPrices(prices, usage));
   if (opts.budget) opts.budget.add(usage, costUsd);
-  // Provider names from both sources: the reply's own "provider" field (if present) and the generation stats.
-  const replyProvider = typeof data.provider === 'string' ? data.provider : null;
   const named = [replyProvider, stats.provider].filter(Boolean);
-  const result = { route: route.name, model: data.model ?? route.model, provider: stats.provider ?? replyProvider, usage, costUsd, id: data.id ?? null };
+  const result = { route: route.name, model: data.model ?? route.model, provider: stats.provider ?? replyProvider, usage, costUsd, id: data.id ?? null,
+    replyProvider, pinnedNames: prices.providerNames, statsPending: Boolean(opts.deferStats) };
   if (opts.debug) {
     // Field names, statuses, ids and provider names only; never message text, never the key.
     opts.debug({ route: route.name, replyFields: Object.keys(data), generationId: data.id ?? null, replyProvider, statsProvider: stats.provider, statsTries: stats.tries });
@@ -238,7 +289,9 @@ async function attempt(route, opts, ctx) {
 
   // The pinned provider must have served it: at least one source names a provider, and every source that does
   // names a pinned one. If neither source answers, the provider is unconfirmed, and that counts as a mismatch.
-  if (!named.length || !named.every((n) => prices.providerNames.includes(n))) {
+  // Deferred: a reply naming a non-pinned provider is a mismatch now; no name at all waits for the batch check.
+  const mismatch = opts.deferStats ? Boolean(replyProvider) && !providerConfirmed([replyProvider], prices.providerNames) : !providerConfirmed(named, prices.providerNames);
+  if (mismatch) {
     throw new ModelError('provider-mismatch', `served by ${named.join(' / ') || 'an unconfirmed provider'}; pinned: ${prices.providerNames.join(', ')}`, { result });
   }
   const content = data.choices?.[0]?.message?.content ?? '';
@@ -253,7 +306,8 @@ async function attempt(route, opts, ctx) {
 
 // opts: { routes: { primary, secondary }, system, user, json = true, maxTokens = 1500, temperature = 0.1,
 //         reasoning = false, timeoutMs = 90000, budget, only: 'primary' | 'secondary' (no fallback),
-//         fetchImpl, keyReader, sleepImpl, priceCache }
+//         secondaryOnce (one attempt on the secondary, no retry: the fallback for a call whose primary reply
+//         failed the batch provider check), deferStats, fetchImpl, keyReader, sleepImpl, randomImpl, priceCache }
 async function chat(opts) {
   const o = { json: true, maxTokens: 1500, temperature: 0.1, reasoning: false, timeoutMs: 90_000, ...opts };
   if (typeof o.system !== 'string' || typeof o.user !== 'string') throw new ModelError('bad-request', 'system and user prompts are required');
@@ -265,6 +319,12 @@ async function chat(opts) {
     key: (o.keyReader ?? (() => readSecret('openrouter-key')))(),
   };
   const { primary, secondary } = o.routes;
+  if (o.secondaryOnce) {
+    // The caller already used the primary (and its retry, where one applied): one secondary attempt, never more.
+    if (!secondary) throw new ModelError('no-secondary', 'no secondary route configured');
+    const r = await attempt(secondary, o, ctx);
+    return { ...r, fellBack: true, retried: false, primaryError: 'provider-mismatch', primaryErrors: ['provider-mismatch'] };
+  }
   // only: one route, no fallback (scripts/model-check.js and the eval); it still gets the one transient retry.
   const first = o.only === 'secondary' ? secondary : primary;
   // primaryErrors: the error code of every failed primary attempt, in order (codes only, for stats and the footer).
@@ -278,7 +338,9 @@ async function chat(opts) {
       primaryErrors.push(e.code);
       lastError = e;
       if (!RETRY_CODES.has(e.code) || tryNo === 2) break;
-      await ctx.sleepImpl(Math.min(e.retryAfterMs ?? RETRY_DELAY_MS, RETRY_MAX_MS));
+      // Retry-After is honored (up to RETRY_MAX_MS); jitter keeps parallel calls from retrying at the same moment.
+      const jitter = Math.floor((o.randomImpl ?? Math.random)() * RETRY_JITTER_MS);
+      await ctx.sleepImpl(Math.min(e.retryAfterMs ?? RETRY_DELAY_MS, RETRY_MAX_MS) + jitter);
     }
   }
   if (o.only || !FALLBACK_CODES.has(lastError.code) || !secondary) {
@@ -297,6 +359,6 @@ async function chat(opts) {
 }
 
 module.exports = {
-  chat, buildBody, livePricing, costFromPrices, createBudget, loadRoutes, estimateTokens,
-  ModelError, FALLBACK_CODES, RETRY_CODES, RETRY_DELAY_MS, CHAT_URL, BASE_URL,
+  chat, buildBody, livePricing, costFromPrices, createBudget, loadRoutes, estimateTokens, verifyGenerations, providerConfirmed,
+  ModelError, FALLBACK_CODES, RETRY_CODES, RETRY_DELAY_MS, RETRY_MAX_MS, RETRY_JITTER_MS, CHAT_URL, BASE_URL,
 };

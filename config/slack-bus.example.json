@@ -59,8 +59,12 @@
     ],
     "internalPrefixes": [
       "success-",
-      "bas"
+      "unitb-"
     ]
   },
-  "_external": "Conversations in these units are external (fully masked before any model call) unless their name starts with an internal prefix. Nothing outside these units is external."
+  "_external": "Conversations in these units are external (fully masked before any model call) unless their name starts with an internal prefix. Nothing outside these units is external.",
+  "ignore": {
+    "C0000000009": "DM: Alex, Robin"
+  },
+  "_ignore": "Conversations you decided to leave unmapped: the digest stops naming them in the DM footer. Managed with node scripts/digest-map.js ignore <name> / remove <name>. A rule, override or group DM entry still wins."
 }

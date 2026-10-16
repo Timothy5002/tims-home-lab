@@ -38,7 +38,7 @@ For each of that unit's customers with activity since the last digest, the diges
 
 ## Masking
 **Data-sharing decision (recorded by the user).** Slack text may go to the pinned providers below, names included.
-- **Internal conversations go unmasked**, except for secrets. Internal means the customer unit's per-customer success channels and every conversation in every other unit.
+- **Internal conversations go unmasked**, except for secrets. Internal means the customer unit's conversations whose names start with one of its internal prefixes (the per-customer success channels, and its own Leadership and internal channels) and every conversation in every other unit.
 - **External conversations get the full masking.** A conversation is external when it belongs to a unit listed in the config's external units **and** its name does not start with one of that unit's internal prefixes (`external` in `config/slack-bus.json`). This covers the unit's group DMs too. Nothing outside those units is external.
 - **Slack's shared flag is not used.** The channel listing records `is_ext_shared` (Slack Connect) for reference, but most shared conversations here are shared between the company's own workspaces, so the user decided that the flag alone does not make a conversation external.
 - **Secrets are masked in every conversation**, internal ones included, and counted per run.
@@ -73,13 +73,13 @@ The digest calls models through **OpenRouter's OpenAI-compatible API** (`POST ht
 
 **Fallback, in code, never by OpenRouter:**
 1. Try the primary.
-2. On a timeout, a 5xx or a 429, wait about 3 s (Retry-After is honored, up to 10 s) and retry the primary **once** (user decision, phase 3).
+2. On a timeout, a 5xx or a 429, wait about 3 s (Retry-After is honored, up to 10 s) plus up to 1 s of random jitter, and retry the primary **once** (user decision, phase 3).
 3. If it still fails that way, or a reply was served by a provider that is not pinned, try the secondary **once**. That is at most three requests per call, and never two models in one request. Retry and fallback reasons are counted as error codes.
 4. Anything else fails the call: auth, out of credit, no endpoint fits the pins or data policy, a call too big for the context, an empty or invalid reply.
 
 Fallbacks should be rare. A digest written by the secondary can read differently, and that is accepted.
 
-**Served-provider check.** After each reply the client checks two sources: the reply's own `provider` field, and OpenRouter's generation stats (`GET /api/v1/generation?id=…`). The stats take about 15 s to appear, so it waits up to about 30 s with growing gaps. At least one source must name a provider, and every source that names one must name a pinned provider. Anything else, including no answer from either source, counts as a mismatch.
+**Served-provider check.** Two sources: the reply's own `provider` field, and OpenRouter's generation stats (`GET /api/v1/generation?id=…`), which take about 15 s to appear. At least one source must name a provider, and every source that names one must name a pinned provider. Anything else, including no answer from either source, counts as a mismatch. In a digest run the reply's field is checked per call (a non-pinned name falls back at once), and the stats are read for a whole stage in one batch, concurrently, with one wait of up to about 30 s; a primary reply that fails the batch check is discarded and its call is sent once to the secondary, which must pass too. The model check and the eval check each call on its own, waiting up to about 30 s.
 
 **What is logged and shown:**
 - **Per run, no text:** which model and provider served each call.
@@ -96,13 +96,13 @@ A run fetches about 180 conversations (Slack calls spaced 1.3 s apart) and then 
 **Approved and built: a standalone launchd schedule** (`com.lab.schedule.slack-digest`, phase 3, 06:00 daily) that runs `node src/digest/run.js --scheduled` directly. This is a recorded exception to "schedules call the dispatcher"; see `docs/decisions.md`. The script:
 - pings its own healthchecks.io check: success, or `/fail` on any failure, abort or deadline. The URL comes from `~/.lab/healthcheck-url-slack-digest`, which the user creates before the schedule is installed. Suggested period 1 day, grace 2 hours.
 - writes one row to the `runs` table in `data/dispatcher.db`. The source is `launchd-direct`, or `manual` for hand runs, and the row holds counts and cost only.
-- enforces its own deadline of 25 minutes. It is a single process and starts no children.
+- enforces its own deadline of 60 minutes (raised from 25 after a real 24-hour run took 21). It is a single process and starts no children. The stats give the time of each phase.
 - keeps the newest 14 digests, delivers the DM (see "Delivery by Slack DM"), then records the success, only if the delivery worked (temp file and rename). A failed delivery leaves the record, so the next run covers the window again.
 
 **Window.** Each run covers everything since the last successful scheduled run, capped at 72 hours, so Mondays and missed days are covered. The time of the last success is kept in `data/digest-state.json`, which holds a timestamp only. With no recorded run, the window is the last 24 hours. Hand runs never move that timestamp unless asked to.
 
 ## Pipeline
-1. **Plan.** Load the config and the saved channel list; on scheduled runs, first refresh that list with paged `conversations.list` calls (conversations left or archived are dropped; new ones that match no rule or override are never read, only named in the DM thread's footer). Take every conversation mapped to a unit, decide the window, and derive the external flag.
+1. **Plan.** Load the config and the saved channel list; on scheduled runs, first refresh that list with paged `conversations.list` calls (conversations left or archived are dropped). Conversations that match no rule or override and are not ignored are never read; every run names up to 8 of them, with the count, in the DM footer until they are mapped or ignored (`scripts/digest-map.js`). Take every conversation mapped to a unit, decide the window, and derive the external flag.
 2. **Fetch** with the shared read-only client (`src/slack.js`):
    - history for the window, plus a 14-day thread lookback to find older threads with new replies, then those replies.
    - Each message keeps: conversation, `ts`, thread, author, a bot flag and text (message text plus attachment text). Housekeeping events (joins, topic changes and similar) are skipped.
@@ -116,9 +116,11 @@ A run fetches about 180 conversations (Slack calls spaced 1.3 s apart) and then 
 6. **Mask** external text (phase 2 onward). Phase 1 runs the masking on the would-be input and reports counts only.
 7. **Model calls:**
    - stage 1: one JSON call per active customer conversation (problems and risks, each with an evidence category)
-   - stage 2: one synthesis call per customer with findings or mentions (one headline, supporting points, all channels merged)
+   - stage 2: one synthesis call per customer with findings or mentions (one headline, a short headline of at most 12 words, supporting points that are each one distinct fact, all channels merged)
+   - the headline check: one cheap call per customer shown under Needs attention (at most 5), with the headline and only the masked messages it cites; overstated headlines are corrected, unsupported ones dropped
    - one per full-mode sub-group that is not customers (archive only), one per brief-mode unit (at most 3 items), one incident check per off-mode unit
-   - at most 3 at a time, starts at least 1.5 s apart, each with a timeout, one primary retry and one fallback
+   - extraction 2 at a time, synthesis and checks 3, starts at least 1.5 s apart, each with a timeout, one primary retry (with jitter) and one fallback; served providers checked per stage in one batch
+   - every extraction, synthesis and check prompt carries the certainty rule: never upgrade an intention, question or report to a fact; attribute reports ("per Delaine")
 8. **Validate** replies against their schema and drop claims with invalid references, and apply the noise rules in code: only evidence categories survive; bot hygiene, personnel and other items are dropped and counted; severity, the Leadership flag, the best link and "bot report" are decided in code. Sanitize model text by removing URLs, `<@…>`, `<!channel>`, `<!here>` and link syntax, so links only come from code and a crafted message cannot make the digest mention or link anyone.
 9. **Render** `data/digests/<date>.md` (mode 600), merged by customer: notable customers ranked (severity, Leadership, strong points, volume) with every point including low ones, quiet customers on one line, incidents, units by mode, skipped counts, and a footer with counts, masking counts, tokens, cost and runtime.
 10. **Finish.** Record the success, prune old digests, send the DM when scheduled, drop all text, write the run row, and ping the healthcheck when scheduled.
@@ -170,7 +172,7 @@ It checks the `notable` flags, the expected issues, that every reference is vali
 ## Delivery by Slack DM (built in phase 3, reshaped in the redesign)
 - **The same Slack app** as the reader. Its bot token (`~/.lab/slack-bot-token`, mode 600, Authorization header only) uses `chat:write` and `im:write`. No events, no file uploads and no read scopes are used with it.
 - **Two methods only:** `conversations.open` and `chat.postMessage`. The client refuses any other method, posts only after `conversations.open` returns a 1:1 DM whose user is the configured ID (`deliverTo`, git-ignored), has no channel argument, and replies only under its own message.
-- **What is sent:** a top-level message (hard cap 1,500 characters: title, Needs attention with at most 5 customers, Watch, Incident, Other units, Skipped), then one threaded reply with per-customer bullets and links (medium and high only) and the model, provider, fallback and cost footer. Nothing is uploaded; the archive file stays on the mini.
+- **What is sent:** a top-level message (hard cap 1,500 characters: title, Needs attention with at most 5 customers and their checked short headlines, Watch names, Incident, Other units, Skipped), then up to 5 threaded replies of at most 3,500 characters with every medium or high customer (full headline, at most 3 bullets with links), an "Also notable" line for anything that did not fit, and the model, provider, fallback, cost and unmapped footer in the last reply. Nothing is ever cut mid-sentence; whole lines are left out instead. Nothing is uploaded; the archive file stays on the mini.
 - **If delivery fails:** the digest file is kept, the success is **not** recorded (the next run covers the window again), and the healthcheck gets `/fail` with the reason code.
 - **Manual steps for the user:** creating and installing the app, its scopes and the App Home Messages tab are done in Slack's web UI.
 
@@ -181,11 +183,11 @@ It checks the `notable` flags, the expected issues, that every reference is vali
 | Per-call input cap (estimated tokens) | 100,000, under DeepSeek V3.2's 163,840-token context with a 30% margin for the estimate; longer calls keep their newest messages |
 | Per-run output cap | 60,000 tokens, reasoning included |
 | Per-run cost cap | $0.50, checked before each call against the worst case for whichever route is about to run; a timed-out request counts its worst case |
-| Output cap per call | about 1,500 tokens per customer, about 800 per unit summary |
+| Output cap per call | about 1,500 tokens per customer, about 800 per unit summary, 300 per headline check |
 | Timeout per model call | 90 s |
-| Retries | one primary retry after about 3 s for a timeout, 5xx or 429; then one attempt on the secondary after a timeout, 5xx, 429 or provider mismatch; at most three requests per call |
-| Run deadline | 25 min |
-| Concurrency | at most 3 model calls at once, starts at least 1.5 s apart |
+| Retries | one primary retry after about 3 s (Retry-After honored up to 10 s) plus up to 1 s of jitter for a timeout, 5xx or 429; then one attempt on the secondary after a timeout, 5xx, 429 or provider mismatch; at most three requests per call |
+| Run deadline | 60 min |
+| Concurrency | extraction 2 model calls at once, synthesis and checks 3; starts at least 1.5 s apart |
 | Month-to-date spend cap | to be decided |
 | Logged per run (no text) | conversations, messages, characters, compression ratio, masked items by type, model calls, fallbacks, model and provider per call, input tokens (cached and not), output and reasoning tokens, cost, runtime, dropped claims |
 

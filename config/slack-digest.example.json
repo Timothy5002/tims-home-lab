@@ -6,7 +6,7 @@
   "defaultWindowHours": 24,
   "maxRunInputTokens": 400000,
   "maxCallInputTokens": 100000,
-  "runDeadlineMinutes": 25,
+  "runDeadlineMinutes": 60,
   "unitOrder": [
     "Unit B",
     "Unit A"

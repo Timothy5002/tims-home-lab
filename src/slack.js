@@ -119,6 +119,8 @@ function createClient() {
 //   groupDms:  { "<group DM id>": { bu, sub?, label?, members? } }  group DMs are only included if listed here;
 //              members (full names, you included) is the set the ID was matched on, and is re-checked on every run.
 //   pendingGroupDms: [{ label, bu, sub?, candidates: [ids], note? }]  not matched; listed in the report until decided.
+//   ignore:    { "<conversation id>": "<label>" }  conversations the user decided to leave unmapped; the digest stops
+//              naming them as unmapped (scripts/digest-map.js ignore). A rule, override or group DM entry still wins.
 //   external:  { units: [bu, ...], internalPrefixes: [prefix, ...] }  which conversations count as external
 //              (fully masked before any model call): a conversation in one of these units whose name does not
 //              start with an internal prefix. Nothing else is external. Slack's is_ext_shared flag is recorded
@@ -127,12 +129,12 @@ function createClient() {
 // Matching is case-insensitive. Keys starting with "_" are comments.
 const globToRegex = (g) => new RegExp(`^${g.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*')}$`, 'i');
 
-function loadConfig() {
-  if (!fs.existsSync(CONFIG_FILE)) {
-    throw new Error(`${path.relative(ROOT, CONFIG_FILE)} not found; copy ${path.relative(ROOT, EXAMPLE_CONFIG_FILE)} to it and edit it`);
+function loadConfig(file = CONFIG_FILE) {
+  if (!fs.existsSync(file)) {
+    throw new Error(`${path.relative(ROOT, file)} not found; copy ${path.relative(ROOT, EXAMPLE_CONFIG_FILE)} to it and edit it`);
   }
   let cfg;
-  try { cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch (e) { throw new Error(`config/slack-bus.json is not valid JSON: ${e.message}`); }
+  try { cfg = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { throw new Error(`config/slack-bus.json is not valid JSON: ${e.message}`); }
   const bad = (msg) => { throw new Error(`config/slack-bus.json: ${msg}`); };
   const target = (v, where) => {
     if (!v || typeof v !== 'object' || typeof v.bu !== 'string' || !v.bu) bad(`${where} needs a "bu" name`);
@@ -182,7 +184,9 @@ function loadConfig() {
     return v;
   };
   const external = { units: strList(ext.units, 'units'), internalPrefixes: strList(ext.internalPrefixes, 'internalPrefixes') };
-  return { rules: compiled, overrides, groupDms, pendingGroupDms, external };
+  const ignore = {};
+  for (const [id, v] of Object.entries(cfg.ignore ?? {})) if (!id.startsWith('_')) ignore[id] = String(v);
+  return { rules: compiled, overrides, groupDms, pendingGroupDms, external, ignore };
 }
 
 // "BU > sub-group", or just "BU".
@@ -200,7 +204,7 @@ function externalReasons(cfg, ch, bu) {
 }
 
 // Returns { bu, sub, group, by, matches, memberDrift, external, externalWhy }. by is how it was placed: override, rule, group-dm,
-// excluded, or null if unplaced. matches lists every rule that matched a channel (more than one is an overlap).
+// excluded, ignored (unplaced, on the ignore list), or null if unplaced. matches lists every rule that matched a channel (more than one is an overlap).
 // memberDrift is true when a listed group DM's current members differ from the members recorded in the config.
 function placeChannelBase(cfg, ch) {
   const none = { bu: null, sub: null, group: null, by: null, matches: [] };
@@ -221,7 +225,8 @@ function placeChannelBase(cfg, ch) {
 }
 
 function placeChannel(cfg, ch) {
-  const p = placeChannelBase(cfg, ch);
+  let p = placeChannelBase(cfg, ch);
+  if (p.by === null && cfg.ignore && Object.hasOwn(cfg.ignore, ch.id)) p = { ...p, by: 'ignored' };
   const externalWhy = externalReasons(cfg, ch, p.bu);
   return { ...p, external: externalWhy.length > 0, externalWhy };
 }

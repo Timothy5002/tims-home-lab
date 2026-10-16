@@ -14,9 +14,15 @@
 // Membership refresh (scheduled runs, or --refresh): before anything else, the conversation list is re-read with
 // paged conversations.list calls (src/slack.js) and data/slack-channels.json is updated. Conversations the user
 // left or that were archived are dropped (counted). New ones that match a rule or override in config/slack-bus.json
-// are read like any other; new ones that match nothing are never read or sent to a model, only named in the DM
-// thread's footer and the archive file (stats and logs hold their count only). If the refresh fails, the run goes
-// on with the saved list and the stats say so.
+// are read like any other. If the refresh fails, the run goes on with the saved list and the stats say so.
+//
+// Unmapped conversations: every run, any conversation the user is in that matches no rule, override or group DM
+// entry and is not on the ignore list (config/slack-bus.json "ignore") is never read or sent to a model; up to 8
+// are named in the last DM reply's footer with the count, until the user maps or ignores them
+// (scripts/digest-map.js). Stats and logs hold the count only.
+//
+// Timing: the stats (and the healthcheck ping) give the time of each phase: membership refresh, Slack fetch,
+// extraction, synthesis, verification, provider checks and delivery.
 //
 // Scheduled runs (--scheduled, from launchd/com.lab.schedule.slack-digest.plist at 06:00): deliver the digest by
 // Slack DM (src/slack-send.js: a short top-level message and one threaded reply; no file), record the success,
@@ -43,7 +49,7 @@ const { fetchConversation } = require('./fetch');
 const { compressBots } = require('./compress');
 const { renderDigest, renderArchive, convLabel, unmappedLabel } = require('./render');
 const { maskText, maskSecrets, newCounts, MASK_TYPES } = require('../mask');
-const { loadRoutes, createBudget, RETRY_CODES } = require('../openrouter');
+const { loadRoutes, createBudget, verifyGenerations, RETRY_CODES } = require('../openrouter');
 const { runPipeline } = require('./pipeline');
 const { loadCustomerConfig, buildRegistry } = require('./customers');
 const { buildDm } = require('./dm');
@@ -71,7 +77,7 @@ function loadDigestConfig() {
     deliverTo: c.deliverTo ?? null,                          // the one Slack user ID the DM may go to (and "me")
     // Per unit or "Unit > Sub-group": full, brief or off (see src/digest/pipeline.js). Unlisted units are brief.
     unitModes: c.unitModes && typeof c.unitModes === 'object' ? c.unitModes : {},
-    runDeadlineMinutes: num('runDeadlineMinutes', 25),
+    runDeadlineMinutes: num('runDeadlineMinutes', 60),
     unitOrder: Array.isArray(c.unitOrder) ? c.unitOrder : [],
     customerGroup: c.customerGroup ?? null, // { bu, sub }: shown first, quiet ones named
     myName: c.myName ?? null,               // left out of group DM labels
@@ -102,7 +108,7 @@ function pruneDigests() {
 const tally = (codes) => codes.reduce((o, c) => ({ ...o, [c]: (o[c] ?? 0) + 1 }), {});
 
 // Daily membership refresh: re-list conversations (conversations.list only), update the saved list, and report
-// what changed. Returns { stats (counts only), newUnmapped: [label] }.
+// what changed. Returns { saved, stats (counts only) }.
 async function refreshMembership(slack, bus, saved) {
   const callsBefore = slack.stats.calls;
   const listing = await listConversations(slack);
@@ -111,11 +117,10 @@ async function refreshMembership(slack, bus, saved) {
   const next = { ...saved, refreshedAt: new Date().toISOString(), seen: { ...listing.seen, total: listing.raw.length },
     member: { ...listing.member, total: listing.memberIds.size }, channels: r.channels.map(place) };
   writePrivateJson(CHANNELS_FILE, next);
-  // Unmapped: no rule, override or group DM entry (an override set to null is a decision, not "unmapped").
+  // Unmapped: no rule, override or group DM entry (an override set to null, or the ignore list, is a decision).
   const newUnmapped = r.added.map(place).filter((c) => c.by === null);
   return {
     saved: next,
-    newUnmapped: newUnmapped.map(unmappedLabel).sort(),
     stats: { status: 'ok', listCalls: slack.stats.calls - callsBefore, conversations: r.channels.length, added: r.added.length,
       addedMapped: r.added.length - newUnmapped.length, newUnmapped: newUnmapped.length, removed: r.removed.length,
       removedMapped: r.removed.filter((c) => place(c).bu).length },
@@ -164,7 +169,7 @@ function readState() {
       status: summary.status, ...pick('error'), ...pick('windowHours'), servedBy: summary.servedBy,
       ...pick('fallbacks'), ...pick('fallbackReasons'), ...pick('retries'), ...pick('retryReasons'),
       ...pick('customersMerged'), ...pick('customersNotable'), ...pick('itemsKept'), ...pick('itemsDropped'), ...pick('itemsDroppedBy'), ...pick('notSummarizedCap'),
-      ...pick('costUsd'), ...pick('membership'), runtimeS: summary.runtimeS, delivery: summary.delivery ?? { status: 'not attempted' },
+      ...pick('costUsd'), ...pick('verification'), ...pick('providerChecks'), ...pick('membership'), ...pick('unmapped'), ...pick('timing'), runtimeS: summary.runtimeS, delivery: summary.delivery ?? { status: 'not attempted' },
     });
     try {
       await ping(JOB, failed, body);
@@ -202,18 +207,25 @@ function readState() {
     if (!fs.existsSync(CHANNELS_FILE)) throw new Error('data/slack-channels.json not found; run node scripts/slack-channels.js first');
     let saved = JSON.parse(fs.readFileSync(CHANNELS_FILE, 'utf8'));
     const slack = createClient();
-    let newUnmapped = [];
+    const timing = {};
+    summary.timing = timing;
+    const timed = async (name, fn) => { const t = Date.now(); try { return await fn(); } finally { timing[name] = Math.round((Date.now() - t) / 100) / 10; } };
     if (opts.scheduled || opts.refresh) {
       progress('Refreshing the conversation list...\n');
       try {
-        const r = await refreshMembership(slack, bus, saved);
+        const r = await timed('membershipRefreshS', () => refreshMembership(slack, bus, saved));
         saved = r.saved;
-        newUnmapped = r.newUnmapped;
         summary.membership = r.stats;
       } catch (e) {
         summary.membership = { status: 'failed', code: e.code ?? 'error' }; // carry on with the saved list
       }
     }
+    // Unmapped conversations (never read): named in the DM footer every run until mapped or ignored. Newest first.
+    const unmappedAll = saved.channels.map((c) => ({ ...c, ...placeChannel(bus, c) })).filter((c) => c.by === null && c.isMember !== false)
+      .sort((a, b) => String(b.lastActivity ?? '').localeCompare(String(a.lastActivity ?? '')) || a.name.localeCompare(b.name));
+    // Member names when the cache has them (from scripts/slack-channels.js), else the handles in the internal name.
+    const unmappedNames = unmappedAll.slice(0, 8).map((c) => (c.type === 'group_dm' && c.memberNames?.length ? convLabel(c, cfg.myName) : unmappedLabel(c)));
+    summary.unmapped = unmappedAll.length;
     const targets = saved.channels.map((c) => ({ ...c, ...placeChannel(bus, c) })).filter((c) => c.bu);
 
     // Window
@@ -246,6 +258,7 @@ function readState() {
     const lookbackStart = windowStart - cfg.threadLookbackDays * 86_400;
     Object.assign(summary, { windowHours: Number(window.hours.toFixed(2)), conversations: targets.length });
 
+    const fetchStarted = Date.now();
     progress('Loading user names...\n');
     const users = await slack.paginate('users.list', { limit: '200' }, 'members');
     const names = new Map(users.map((u) => [u.id, u.profile?.display_name || u.real_name || u.name]));
@@ -282,6 +295,8 @@ function readState() {
       if (conv.external && compressed.stats.messagesIn) totals.externalConversations++;
       blocks.push({ conv, compressed, parents: r.parents, error: null });
     }
+
+    timing.slackFetchS = Math.round((Date.now() - fetchStarted) / 100) / 10;
 
     if (opts['mask-report']) {
       // Pattern names, conversation IDs and message timestamps only; never text, and no digest is written.
@@ -335,6 +350,7 @@ function readState() {
       model = await runPipeline({
         blocks, registry, modes: cfg.unitModes, me: cfg.deliverTo, nameOf: ctx.nameOf, routes, budget, maskCounts,
         runCap: cfg.maxRunInputTokens, callCap: cfg.maxCallInputTokens, reasoning: opts.reasoning,
+        verify: (items) => verifyGenerations(items), // the served provider, checked per stage in one batch
         onDone: (r) => progress(`  model [${++done}] ${r.kind} ${r.ok ? 'ok' : r.error}${r.retried ? ' (retried)' : ''}${r.fellBack ? ' (secondary)' : ''}\n`),
       });
       const results = model.results;
@@ -349,6 +365,9 @@ function readState() {
       const fallbackReasons = tally(results.filter((r) => r.fellBack).map((r) => r.primaryErrors?.at(-1) ?? r.primaryError ?? 'unknown'));
       const recoveredByRetry = results.filter((r) => r.ok && r.retried && !r.fellBack).length;
       const st = model.stats;
+      const sec = (ms) => Math.round(ms / 100) / 10;
+      Object.assign(timing, { extractionS: sec(model.timing.extractionMs), synthesisS: sec(model.timing.synthesisMs),
+        verificationS: sec(model.timing.verificationMs), providerChecksS: sec(model.timing.providerCheckMs) });
       const droppedTotal = Object.values(st.itemsDropped).reduce((a, b) => a + b, 0);
       Object.assign(summary, {
         modelCalls: results.length, calls: st.calls, callsOk: ok.length, callsFailed: results.length - ok.length,
@@ -361,6 +380,7 @@ function readState() {
         retries: retriedCalls.length, retryReasons, recoveredByRetry, fallbacks: fellBack, fallbackReasons, servedBy: served,
         tokens: { input: budget.used.inputTokens, output: budget.used.outputTokens, reasoning: budget.used.reasoningTokens },
         costUsd: Number(budget.used.costUsd.toFixed(6)), costCapUsd: cfg.maxRunCostUsd,
+        verification: st.verification, providerChecks: model.providerChecks,
       });
       ctx.analyzed = true;
       const names = Object.entries(served);
@@ -370,7 +390,9 @@ function readState() {
       const fmt = (o) => Object.entries(o).map(([k, v]) => `${k} ${v}`).join(', ');
       const nsc = st.notSummarizedCap;
       modelLines = [
-        `- Model: ${ctx.writtenBy}. Calls ${results.length} (${st.calls.stage1} stage 1, ${st.calls.synthesis} synthesis; ${ok.length} ok${results.length - ok.length ? `, ${results.length - ok.length} not ok` : ''}).`,
+        `- Model: ${ctx.writtenBy}. Calls ${results.length} (${st.calls.stage1} stage 1, ${st.calls.synthesis} synthesis, ${st.calls.verification} headline checks; ${ok.length} ok${results.length - ok.length ? `, ${results.length - ok.length} not ok` : ''}).`,
+        `- Headline checks: ${st.verification.supported} supported, ${st.verification.overstated} softened, ${st.verification.unsupported} dropped, ${st.verification.failed} not checked (call failed).`,
+        `- Provider checks (batched per stage): ${model.providerChecks.checked} replies, ${model.providerChecks.mismatches} not confirmed, ${model.providerChecks.reruns} re-sent to the secondary.`,
         `- Primary retries: ${retriedCalls.length}${retriedCalls.length ? ` (${fmt(retryReasons)}; ${recoveredByRetry} recovered on the retry)` : ''}. Fallbacks to the secondary: ${fellBack}${fellBack ? ` (${fmt(fallbackReasons)})` : ''}.`,
         `- Customers: ${st.customersWithActivity} with activity or mentions, ${st.customersMerged} merged, ${st.customersNotable} notable${st.customersFallback ? ` (${st.customersFallback} not merged: stage-1 findings shown)` : ''}; ${registry.unmatched.length} channels matched no customer; ${st.mentionMessages} mention messages.`,
         `- Not summarized (cap): ${nsc.calls} ${nsc.calls === 1 ? 'call' : 'calls'}, ${nsc.messages} messages; trimmed to the per-call cap: ${nsc.trimmedCalls} ${nsc.trimmedCalls === 1 ? 'call' : 'calls'}, ${nsc.trimmedMessages} oldest messages left out. Run cap ${cfg.maxRunInputTokens.toLocaleString('en-US')} tokens (stage 1 planned ${model.plan.estimatedInputTokens.toLocaleString('en-US')}), per-call cap ${cfg.maxCallInputTokens.toLocaleString('en-US')}.`,
@@ -385,10 +407,11 @@ function readState() {
         `$${budget.used.costUsd.toFixed(4)}`,
         `window ${window.hours.toFixed(1)} h`,
         ...(registry.unmatched.length ? [`${registry.unmatched.length} unmatched channels`] : []),
-        ...(newUnmapped.length ? [`${newUnmapped.length} new, unmapped: ${newUnmapped.slice(0, 15).join(', ')}${newUnmapped.length > 15 ? ` and ${newUnmapped.length - 15} more` : ''}`] : []),
-        ...(summary.membership?.status === 'failed' ? ['membership refresh failed'] : []),
       ];
     }
+    // Unmapped conversations (not read) are named every run until mapped or ignored; then a failed refresh.
+    dmFooter.push(...(unmappedAll.length ? [`${unmappedAll.length} unmapped: ${unmappedNames.join(', ')}${unmappedAll.length > unmappedNames.length ? ` and ${unmappedAll.length - unmappedNames.length} more` : ''}`] : []),
+      ...(summary.membership?.status === 'failed' ? ['membership refresh failed'] : []));
 
     const wouldSendTokens = Math.ceil(totals.wouldSendChars / 4); // same characters / 4 estimate as the measurement
     const s = slack.stats;
@@ -406,8 +429,9 @@ function readState() {
         `- Masking dry run (secrets in every conversation, the rest in external ones): ${MASK_TYPES.map((t) => `${t} ${maskCounts[t]}`).join(', ')}. Nothing was sent.`,
       ]),
       ...(summary.membership ? [summary.membership.status === 'ok'
-        ? `- Membership refresh: ${summary.membership.conversations} conversations; ${summary.membership.added} new (${summary.membership.addedMapped} mapped, ${summary.membership.newUnmapped} unmapped and not read${newUnmapped.length ? `: ${newUnmapped.join(', ')}` : ''}); ${summary.membership.removed} gone (${summary.membership.removedMapped} of them mapped).`
+        ? `- Membership refresh: ${summary.membership.conversations} conversations; ${summary.membership.added} new (${summary.membership.addedMapped} mapped, ${summary.membership.newUnmapped} unmapped); ${summary.membership.removed} gone (${summary.membership.removedMapped} of them mapped).`
         : `- Membership refresh failed (${summary.membership.code}); the saved conversation list was used.`] : []),
+      `- Unmapped conversations (not read; map or ignore them with scripts/digest-map.js): ${unmappedAll.length}${unmappedAll.length ? ` (${unmappedNames.join(', ')}${unmappedAll.length > unmappedNames.length ? ` and ${unmappedAll.length - unmappedNames.length} more` : ''})` : ''}.`,
       `- Not sent to any model by choice (noCloud): ${totals.noCloudConversations} active ${totals.noCloudConversations === 1 ? 'conversation' : 'conversations'}.`,
       `- Slack API calls: ${s.calls}, rate-limit waits: ${s.rateLimited}. Runtime: ${Math.round((Date.now() - started) / 1000)} s.`,
     ];
@@ -427,10 +451,16 @@ function readState() {
         if (!cfg.deliverTo) throw Object.assign(new Error('no deliverTo in config/slack-digest.json'), { code: 'no-recipient' });
         const dm = buildDm({ model, window, ctx, footer: dmFooter });
         const sender = createSender({ recipient: cfg.deliverTo });
-        await sender.openDm();
-        const posted = await sender.postText(dm.top);
-        summary.delivery = { status: 'failed', code: 'thread-not-posted', topChars: dm.stats.topChars };
-        await sender.postText(dm.thread, posted.ts);
+        await timed('deliveryS', async () => {
+          await sender.openDm();
+          const posted = await sender.postText(dm.top);
+          summary.delivery = { status: 'failed', code: 'thread-not-posted', topChars: dm.stats.topChars };
+          // The replies, in order, under the top-level message (at most 5; the footer is in the last).
+          for (const [k, reply] of dm.replies.entries()) {
+            await sender.postText(reply, posted.ts);
+            summary.delivery.repliesPosted = k + 1;
+          }
+        });
         summary.delivery = { status: 'ok', ...dm.stats, slackCalls: sender.stats.calls };
       } catch (e) {
         summary.delivery = { ...summary.delivery, status: 'failed', code: e.code ?? 'error' };
