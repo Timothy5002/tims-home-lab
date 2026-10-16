@@ -261,9 +261,11 @@ async function listConversations(slack) {
 // Applies a fresh listing (listConversations) to the saved channel list, for the digest's daily refresh.
 // Conversations the user is still in keep their saved details (group DM members, last activity) with the name,
 // size and shared flag updated; new ones are added with what the listing knows (no extra calls, so a new group
-// DM has no member names); conversations that were archived or left are dropped. Returns the new list plus the
+// DM has no member names and no last activity) and the time they were first seen; conversations that were archived
+// or left are dropped. The listing has no message-activity field, so lastActivity is never updated here: it comes
+// only from scripts/slack-channels.js (one history call per conversation). Returns the new list plus the
 // added and removed entries. Names and IDs only; nothing is read from any conversation.
-function applyListing(saved, listing) {
+function applyListing(saved, listing, now = new Date()) {
   const byId = new Map(listing.raw.map((c) => [c.id, c]));
   const keep = (id) => listing.memberIds.has(id) || (saved.scope === 'all' && byId.has(id));
   const old = new Map(saved.channels.map((c) => [c.id, c]));
@@ -276,12 +278,29 @@ function applyListing(saved, listing) {
       ...(c.is_mpim ? {} : { members: c.num_members ?? null }) };
     if (old.has(c.id)) channels.push({ ...old.get(c.id), ...fresh });
     else {
-      const ch = { id: c.id, type: channelType(c), members: c.num_members ?? null, lastActivity: null, ...fresh };
+      const ch = { id: c.id, type: channelType(c), members: c.num_members ?? null, lastActivity: null, firstSeenAt: now.toISOString(), ...fresh };
       channels.push(ch);
       added.push(ch);
     }
   }
   return { channels, added, removed };
+}
+
+// True when a conversation had activity in the last `days` days, as far as the saved list knows: its last message
+// (lastActivity, from scripts/slack-channels.js) or, for one the refresh added, when it was first seen (joining a
+// conversation counts, since its messages have never been looked at). Unknown counts as inactive.
+function recentlyActive(c, days = 30, now = Date.now()) {
+  const t = Math.max(Date.parse(c.lastActivity ?? '') || 0, Date.parse(c.firstSeenAt ?? '') || 0);
+  return t >= now - days * 86_400_000;
+}
+
+// Unmapped conversations (no rule, override or group DM entry; ignored ones excluded) the user is in, split into
+// active in the last `days` days (newest first; the digest names these) and inactive (only counted).
+function splitUnmapped(cfg, channels, { days = 30, now = Date.now() } = {}) {
+  const all = channels.map((c) => ({ ...c, ...placeChannel(cfg, c) })).filter((c) => c.by === null && c.isMember !== false);
+  const newest = (c) => String(c.lastActivity ?? c.firstSeenAt ?? '');
+  const active = all.filter((c) => recentlyActive(c, days, now)).sort((a, b) => newest(b).localeCompare(newest(a)) || a.name.localeCompare(b.name));
+  return { active, inactive: all.filter((c) => !recentlyActive(c, days, now)) };
 }
 
 // Writes JSON readable only by this user (the files hold channel names and member names).
@@ -313,5 +332,5 @@ function printTable(header, rows) {
 module.exports = {
   ROOT, DATA_DIR, CHANNELS_FILE, CONFIG_FILE, SKIP_SUBTYPES, messageText, isBot, permalink, readSecret,
   createClient, SlackError, loadConfig, placeChannel, groupName, writePrivateJson, localDay, fmtInt, printTable, sleep,
-  channelType, listConversations, applyListing,
+  channelType, listConversations, applyListing, recentlyActive, splitUnmapped,
 };

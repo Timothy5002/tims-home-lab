@@ -16,10 +16,11 @@
 // left or that were archived are dropped (counted). New ones that match a rule or override in config/slack-bus.json
 // are read like any other. If the refresh fails, the run goes on with the saved list and the stats say so.
 //
-// Unmapped conversations: every run, any conversation the user is in that matches no rule, override or group DM
-// entry and is not on the ignore list (config/slack-bus.json "ignore") is never read or sent to a model; up to 8
-// are named in the last DM reply's footer with the count, until the user maps or ignores them
-// (scripts/digest-map.js). Stats and logs hold the count only.
+// Unmapped conversations: any conversation the user is in that matches no rule, override or group DM entry is
+// never read or sent to a model. Those not on the ignore list (config/slack-bus.json "ignore") and active in the last
+// 30 days (src/slack.js recentlyActive) are named in the last DM reply's footer, up to 8 plus their count; inactive
+// ones are only counted in the stats ("unmapped, inactive"). Map or ignore them with scripts/digest-map.js. Stats
+// and logs hold counts only.
 //
 // Timing: the stats (and the healthcheck ping) give the time of each phase: membership refresh, Slack fetch,
 // extraction, synthesis, verification, provider checks and delivery.
@@ -44,7 +45,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { parseArgs } = require('node:util');
-const { ROOT, DATA_DIR, CHANNELS_FILE, createClient, loadConfig, placeChannel, localDay, listConversations, applyListing, writePrivateJson } = require('../slack');
+const { ROOT, DATA_DIR, CHANNELS_FILE, createClient, loadConfig, placeChannel, localDay, listConversations, applyListing, writePrivateJson, splitUnmapped } = require('../slack');
 const { fetchConversation } = require('./fetch');
 const { compressBots } = require('./compress');
 const { renderDigest, renderArchive, convLabel, unmappedLabel } = require('./render');
@@ -220,12 +221,12 @@ function readState() {
         summary.membership = { status: 'failed', code: e.code ?? 'error' }; // carry on with the saved list
       }
     }
-    // Unmapped conversations (never read): named in the DM footer every run until mapped or ignored. Newest first.
-    const unmappedAll = saved.channels.map((c) => ({ ...c, ...placeChannel(bus, c) })).filter((c) => c.by === null && c.isMember !== false)
-      .sort((a, b) => String(b.lastActivity ?? '').localeCompare(String(a.lastActivity ?? '')) || a.name.localeCompare(b.name));
+    // Unmapped conversations (never read). Only those active in the last 30 days are named in the DM footer, newest
+    // first; inactive ones are counted. Ignored ones are neither (placeChannel marks them "ignored").
+    const { active: unmappedActive, inactive: unmappedInactive } = splitUnmapped(bus, saved.channels);
     // Member names when the cache has them (from scripts/slack-channels.js), else the handles in the internal name.
-    const unmappedNames = unmappedAll.slice(0, 8).map((c) => (c.type === 'group_dm' && c.memberNames?.length ? convLabel(c, cfg.myName) : unmappedLabel(c)));
-    summary.unmapped = unmappedAll.length;
+    const unmappedNames = unmappedActive.slice(0, 8).map((c) => (c.type === 'group_dm' && c.memberNames?.length ? convLabel(c, cfg.myName) : unmappedLabel(c)));
+    summary.unmapped = { active: unmappedActive.length, inactive: unmappedInactive.length };
     const targets = saved.channels.map((c) => ({ ...c, ...placeChannel(bus, c) })).filter((c) => c.bu);
 
     // Window
@@ -410,7 +411,7 @@ function readState() {
       ];
     }
     // Unmapped conversations (not read) are named every run until mapped or ignored; then a failed refresh.
-    dmFooter.push(...(unmappedAll.length ? [`${unmappedAll.length} unmapped: ${unmappedNames.join(', ')}${unmappedAll.length > unmappedNames.length ? ` and ${unmappedAll.length - unmappedNames.length} more` : ''}`] : []),
+    dmFooter.push(...(unmappedActive.length ? [`${unmappedActive.length} unmapped: ${unmappedNames.join(', ')}${unmappedActive.length > unmappedNames.length ? ` and ${unmappedActive.length - unmappedNames.length} more` : ''}`] : []),
       ...(summary.membership?.status === 'failed' ? ['membership refresh failed'] : []));
 
     const wouldSendTokens = Math.ceil(totals.wouldSendChars / 4); // same characters / 4 estimate as the measurement
@@ -431,7 +432,7 @@ function readState() {
       ...(summary.membership ? [summary.membership.status === 'ok'
         ? `- Membership refresh: ${summary.membership.conversations} conversations; ${summary.membership.added} new (${summary.membership.addedMapped} mapped, ${summary.membership.newUnmapped} unmapped); ${summary.membership.removed} gone (${summary.membership.removedMapped} of them mapped).`
         : `- Membership refresh failed (${summary.membership.code}); the saved conversation list was used.`] : []),
-      `- Unmapped conversations (not read; map or ignore them with scripts/digest-map.js): ${unmappedAll.length}${unmappedAll.length ? ` (${unmappedNames.join(', ')}${unmappedAll.length > unmappedNames.length ? ` and ${unmappedAll.length - unmappedNames.length} more` : ''})` : ''}.`,
+      `- Unmapped conversations (not read; map or ignore them with scripts/digest-map.js): ${summary.unmapped.inactive} inactive for 30 days (counted only); ${unmappedActive.length} active${unmappedActive.length ? ` (${unmappedNames.join(', ')}${unmappedActive.length > unmappedNames.length ? ` and ${unmappedActive.length - unmappedNames.length} more` : ''})` : ''}.`,
       `- Not sent to any model by choice (noCloud): ${totals.noCloudConversations} active ${totals.noCloudConversations === 1 ? 'conversation' : 'conversations'}.`,
       `- Slack API calls: ${s.calls}, rate-limit waits: ${s.rateLimited}. Runtime: ${Math.round((Date.now() - started) / 1000)} s.`,
     ];

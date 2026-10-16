@@ -783,7 +783,7 @@ const hang = (init) => new Promise((_, reject) => {
     const bus = () => JSON.parse(fs.readFileSync(paths.bus, 'utf8'));
     const cust = () => JSON.parse(fs.readFileSync(paths.customers, 'utf8'));
     const lu = mapRun(['list-unmapped'], paths);
-    check('map: list-unmapped lists only conversations no rule, override or group DM entry maps', /Unmapped .*: 4;/.test(lu.lines[0]) && lu.lines.join('\n').includes('#new-ops ') && !lu.lines.join('\n').includes('#sales'), lu.lines.join(' | '));
+    check('map: list-unmapped lists only conversations no rule, override or group DM entry maps', /digest\): 4 \(/.test(lu.lines[0]) && lu.lines.join('\n').includes('#new-ops ') && !lu.lines.join('\n').includes('#sales'), lu.lines.join(' | '));
     const before = fs.readFileSync(paths.bus, 'utf8');
     const amb = mapRun(['map', 'new-op', 'Unit A'], paths);
     check('map: no exact match lists candidates and writes nothing', amb.code === 1 && amb.lines.some((l) => l.includes('C2')) && amb.lines.some((l) => l.includes('C3')) && fs.readFileSync(paths.bus, 'utf8') === before, amb.lines.join(' | '));
@@ -800,7 +800,7 @@ const hang = (init) => new Promise((_, reject) => {
     check('map: ignore adds an unmapped conversation to the ignore list; mapped ones are refused',
       ig.code === 0 && bus().ignore.G2 && mapRun(['ignore', 'new-ops'], paths).code === 1, ig.lines.join(' | '));
     const lu2 = mapRun(['list-unmapped'], paths);
-    check('map: ignored and mapped conversations leave the unmapped list', /: 1; ignored: 1\./.test(lu2.lines[0]), lu2.lines[0]);
+    check('map: ignored and mapped conversations leave the unmapped list', /digest\): 1 \(.*\); ignored: 1\./.test(lu2.lines[0]), lu2.lines[0]);
     const mc = mapRun(['map-customer', 'prospect-coordination', 'Acme'], paths);
     check('map-customer: attaches the channel to the customer and takes it out of the other bucket',
       mc.code === 0 && JSON.stringify(cust().customers.acme?.channels) === '["C5"]' && cust().otherBucket.channels.length === 0, mc.lines.join(' | '));
@@ -810,7 +810,51 @@ const hang = (init) => new Promise((_, reject) => {
     const rm2 = mapRun(['remove', 'G2'], paths);
     check('remove: drops customer assignments and ignore entries and prints them', rm.code === 0 && !cust().customers.acme.channels.length && !bus().ignore.G2 && rm.lines[0].includes('customer acme') && rm2.lines[0].includes('ignore entry'));
     check('map: config files stay mode 600 and no temp file is left', (fs.statSync(paths.bus).mode & 0o777) === 0o600 && (fs.statSync(paths.customers).mode & 0o777) === 0o600 && !fs.readdirSync(dir).some((f) => f.endsWith('.tmp')));
+    // ignore-all-unmapped: a preview writes nothing; --yes ignores them in one write; --active-only limits it.
+    writeAll();
+    const NOW = Date.parse('2026-10-16T12:00:00Z');
+    const chs = JSON.parse(fs.readFileSync(paths.channels, 'utf8'));
+    for (const c of chs.channels) {
+      if (c.id === 'C2') c.lastActivity = '2026-10-10T09:00:00Z';                       // active
+      if (c.id === 'G1') c.lastActivity = '2026-08-01T09:00:00Z';                       // inactive
+      if (c.id === 'G2') { c.lastActivity = null; c.firstSeenAt = '2026-10-15T06:00:00Z'; } // newly joined: counts as active
+    }
+    fs.writeFileSync(paths.channels, JSON.stringify(chs));
+    const busBefore = fs.readFileSync(paths.bus, 'utf8');
+    const pv = mapRun(['ignore-all-unmapped'], paths, NOW);
+    check('ignore-all-unmapped: without --yes prints the count and names, writes nothing',
+      pv.code === 0 && /Would ignore 4 unmapped/.test(pv.lines[0]) && pv.lines.some((l) => l.includes('Nothing was changed')) && fs.readFileSync(paths.bus, 'utf8') === busBefore, pv.lines.join(' | '));
+    const pva = mapRun(['ignore-all-unmapped', '--active-only'], paths, NOW);
+    check('ignore-all-unmapped --active-only: only conversations active in 30 days (a newly seen one counts), newest first',
+      /Would ignore 2 /.test(pva.lines[0]) && pva.lines[1].includes('G2') && pva.lines[2].includes('C2') && !pva.lines.join(' ').includes('G1'), pva.lines.join(' | '));
+    const yes = mapRun(['ignore-all-unmapped', '--active-only', '--yes'], paths, NOW);
+    check('ignore-all-unmapped --yes: adds them to the ignore list in one write and prints them',
+      yes.code === 0 && JSON.stringify(Object.keys(bus().ignore ?? {}).sort()) === '["C2","G2"]' && /Ignored 2 /.test(yes.lines[0]) && !fs.readdirSync(dir).some((f) => f.endsWith('.tmp')), yes.lines.join(' | '));
+    const yes2 = mapRun(['ignore-all-unmapped', '--yes'], paths, NOW);
+    check('ignore-all-unmapped --yes (all): the rest are ignored; nothing is left unmapped', /Ignored 2 /.test(yes2.lines[0]) && /digest\): 0 \(/.test(mapRun(['list-unmapped'], paths, NOW).lines[0]), yes2.lines.join(' | '));
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+  {
+    // The footer's split: only unmapped, not ignored, active in 30 days are named; inactive ones are counted.
+    const { splitUnmapped, recentlyActive, applyListing } = require('../src/slack');
+    const NOW = Date.parse('2026-10-16T12:00:00Z');
+    const cfg = { rules: [{ bu: 'Unit A', sub: null, label: 'r', test: (n) => n === 'mapped' }], overrides: {}, groupDms: {}, pendingGroupDms: [], external: { units: [], internalPrefixes: [] }, ignore: { G3: 'DM: x' } };
+    const chs = [
+      { id: 'C1', name: 'mapped', type: 'public', lastActivity: '2026-10-15T00:00:00Z' },
+      { id: 'C2', name: 'busy', type: 'public', lastActivity: '2026-10-14T00:00:00Z' },
+      { id: 'C3', name: 'old', type: 'public', lastActivity: '2026-07-01T00:00:00Z' },
+      { id: 'C4', name: 'never', type: 'public', lastActivity: null },
+      { id: 'G2', name: 'mpdm-a--b-1', type: 'group_dm', lastActivity: null, firstSeenAt: '2026-10-16T06:00:00Z' },
+      { id: 'G3', name: 'mpdm-c--d-1', type: 'group_dm', lastActivity: '2026-10-15T00:00:00Z' },
+    ];
+    const u = splitUnmapped(cfg, chs, { now: NOW });
+    check('footer: only unmapped, not ignored, active in 30 days are listed (newest first); inactive and unknown are counted only',
+      u.active.map((c) => c.id).join() === 'G2,C2' && u.inactive.map((c) => c.id).sort().join() === 'C3,C4', JSON.stringify({ a: u.active.map((c) => c.id), i: u.inactive.map((c) => c.id) }));
+    check('footer: an inactive conversation that becomes active is listed again on its own', recentlyActive({ lastActivity: '2026-10-16T00:00:00Z' }, 30, NOW) && !recentlyActive({ lastActivity: '2026-09-01T00:00:00Z' }, 30, NOW));
+    const r = applyListing({ scope: 'member', channels: [{ id: 'C1', name: 'a', type: 'public', firstSeenAt: '2026-01-01T00:00:00Z' }] },
+      { raw: [{ id: 'C1', name: 'a', is_member: true }, { id: 'C9', name: 'b', is_member: true }], memberIds: new Set(['C1', 'C9']) }, new Date(NOW));
+    check('refresh: a new conversation records when it was first seen; a kept one keeps its date',
+      r.channels.find((c) => c.id === 'C9').firstSeenAt === new Date(NOW).toISOString() && r.channels.find((c) => c.id === 'C1').firstSeenAt === '2026-01-01T00:00:00Z');
   }
 
   // ---------- Slack DM delivery: send-only client (invented IDs and text) ----------

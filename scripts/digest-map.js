@@ -6,18 +6,23 @@
 // or prints message text, and never touches a token.
 //
 // Usage: node scripts/digest-map.js <command> ...
-//   list-unmapped                       conversations you are in that no rule maps and that are not ignored
+//   list-unmapped                       conversations you are in that no rule maps and that are not ignored, each
+//                                       marked active (last 30 days, as far as the cached listing knows) or not
 //   map <name> <Unit>[/<Sub-group>]     map a channel (override) or a group DM (by ID, members recorded) to a unit;
 //                                       an unknown unit or sub-group needs --new
 //   map-customer <name> <customer>      attach a customer-unit channel to a customer (key or name)
 //   ignore <name>                       stop listing an unmapped conversation
+//   ignore-all-unmapped [--active-only] [--yes]
+//                                       without --yes: print how many would be ignored and the first 20, write nothing;
+//                                       with --yes: add them all to the ignore list in one atomic write
+//                                       (--active-only: only those active in the last 30 days; default: all)
 //   remove <name>                       undo: drop its override, group DM entry, ignore entry and customer assignment
 // <name>: a channel name (with or without #), a conversation ID, or a group DM's full member list, comma-separated
 // ("Ann Lee, Bo Diaz"; your own name may be left out). A name that fits more than one conversation, or none, lists
 // the candidates and changes nothing. Config files are written atomically (temp file, then rename), mode 600.
 const fs = require('node:fs');
 const path = require('node:path');
-const { ROOT, CHANNELS_FILE, CONFIG_FILE, loadConfig, placeChannel } = require('../src/slack');
+const { ROOT, CHANNELS_FILE, CONFIG_FILE, loadConfig, placeChannel, recentlyActive, splitUnmapped } = require('../src/slack');
 const { loadCustomerConfig, buildRegistry, CONFIG: CUSTOMERS_FILE } = require('../src/digest/customers');
 const { convLabel } = require('../src/digest/render');
 
@@ -53,7 +58,7 @@ function resolveConv(query, channels, me) {
   return { candidates: near.slice(0, 20) };
 }
 
-function run(argv, paths = DEFAULT_PATHS) {
+function run(argv, paths = DEFAULT_PATHS, now = Date.now()) {
   const out = [];
   const say = (l) => out.push(l);
   const args = argv.filter((a) => !a.startsWith('--'));
@@ -79,11 +84,34 @@ function run(argv, paths = DEFAULT_PATHS) {
     return { error: fail(r.candidates.length ? `"${name}" fits more than one conversation, or none exactly:` : `No conversation in the cached listing matches "${name}".`, r.candidates) };
   };
 
+  // Active ones first (newest first), then inactive: the same split the digest's footer uses.
+  const unmapped = () => { const u = splitUnmapped(bus, channels, { now }); return [...u.active, ...u.inactive]; };
+  const active = (c) => recentlyActive(c, 30, now);
+
   if (cmd === 'list-unmapped') {
-    const un = channels.filter((c) => c.by === null && c.isMember !== false)
-      .sort((a, b) => String(b.lastActivity ?? '').localeCompare(String(a.lastActivity ?? '')) || a.name.localeCompare(b.name));
-    say(`Unmapped conversations (never read by the digest): ${un.length}; ignored: ${channels.filter((c) => c.by === 'ignored').length}.`);
-    for (const c of un) say(`  ${c.type.padEnd(8)} last ${c.lastActivity ? c.lastActivity.slice(0, 10) : '-'.padEnd(10)}  ${show(c)}`);
+    const un = unmapped();
+    const act = un.filter(active).length;
+    say(`Unmapped conversations (never read by the digest): ${un.length} (${act} active in the last 30 days, ${un.length - act} inactive); ignored: ${channels.filter((c) => c.by === 'ignored').length}.`);
+    for (const c of un) say(`  ${active(c) ? 'active  ' : 'inactive'} ${c.type.padEnd(8)} last ${c.lastActivity ? c.lastActivity.slice(0, 10) : '-'.padEnd(10)}  ${show(c)}`);
+    return { code: 0, lines: out };
+  }
+
+  if (cmd === 'ignore-all-unmapped') {
+    const list = unmapped().filter((c) => !flags.has('--active-only') || active(c));
+    const what = flags.has('--active-only') ? 'unmapped conversations active in the last 30 days' : 'unmapped conversations';
+    if (!list.length) { say(`No ${what} to ignore. Nothing was changed.`); return { code: 0, lines: out }; }
+    if (!flags.has('--yes')) {
+      say(`Would ignore ${list.length} ${what}${list.length > 20 ? ' (first 20 shown)' : ''}:`);
+      for (const c of list.slice(0, 20)) say(`  ${active(c) ? 'active  ' : 'inactive'} ${show(c)}`);
+      say('Nothing was changed. Run again with --yes to ignore them.');
+      return { code: 0, lines: out };
+    }
+    busRaw.ignore = { ...(busRaw.ignore ?? {}) };
+    for (const c of list) busRaw.ignore[c.id] = c.label;
+    writeJsonAtomic(paths.bus, busRaw);
+    say(`Ignored ${list.length} ${what} in ${path.relative(ROOT, paths.bus)} (one write). Undo one with: remove <name>.`);
+    for (const c of list.slice(0, 20)) say(`  ${show(c)}`);
+    if (list.length > 20) say(`  and ${list.length - 20} more`);
     return { code: 0, lines: out };
   }
 
@@ -177,7 +205,7 @@ function run(argv, paths = DEFAULT_PATHS) {
     return { code: 0, lines: out };
   }
 
-  say('Usage: node scripts/digest-map.js list-unmapped | map <name> <Unit>[/<Sub-group>] [--new] | map-customer <name> <customer> | ignore <name> | remove <name>');
+  say('Usage: node scripts/digest-map.js list-unmapped | map <name> <Unit>[/<Sub-group>] [--new] | map-customer <name> <customer> | ignore <name> | ignore-all-unmapped [--active-only] [--yes] | remove <name>');
   return { code: 2, lines: out };
 }
 
